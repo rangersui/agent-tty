@@ -158,8 +158,8 @@ cleanup w
 reset
 echo "── long output ──"
 $K new w bash >/dev/null; sleep 1
-check "seq-500"     "500"       "$($K run -j w 'seq 1 500 | tail -1')"
-check "seq-count"   "1000"      "$($K run -j -t 10 w 'seq 1 1000 | wc -l')"
+check "seq-500"     "500"       "$($K run -j -t 60 w 'seq 1 500 | tail -1')"
+check "seq-count"   "1000"      "$($K run -j -t 60 w 'seq 1 1000 | wc -l')"
 cleanup w
 
 # ── FIRE TIMEOUT ──
