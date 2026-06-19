@@ -51,7 +51,7 @@ ANSI_RE = re.compile(
     r"|\x1b[()][0-9A-B]"
     r"|\x1b[>=]"
     r"|\x1b\x50[^\x1b]*\x1b\\"
-    r"|\r"
+    r"|\x08|\r"
 )
 
 # cell event patterns (written directly to log by k)

@@ -18,17 +18,19 @@ k run -j py "print(42)"
 ## Commands
 
 ```
-k new    <session> <cmd...> [--prompt="x"]     spawn
+k new    <session> [cmd...] [--prompt="x"]     spawn (default: bash)
 k new    <session> <cmd> --prompt=./hook        hook mode
-k fire   [session] <code> [-t N]               async fire
+k fire   [-t N] [session] <code>               async fire (default 300s)
 k poll   [session] [cell_id]                   poll (O(1))
-k run    [session] <code>                      sync (lock + send + wait)
-k run -j [session] <code>                      sync, JSON
-k run -j -t N [session] <code>                 sync, timeout
+k run    [-j] [-t N] [session] <code>          sync (default 30s)
+k await  ...                                   alias for run
 k notify [session] <message>                   notification
 k int    [session]                             ctrl-c
-k kill   <session>                             cleanup
-k ls / k status / k watch / k history
+k kill   <session>                             kill + cleanup
+k ls                                           list sessions
+k status [session]                             health check
+k watch  [session]                             live filtered view
+k history [-n N] [session]                     last N×5 lines (default 5)
 ```
 
 ## Frame Detection
@@ -41,7 +43,7 @@ Three modes via `--prompt`:
 | `"(gdb)"` | exact | match prompt string |
 | `./hook.py` | hook | stdin lines → hook exit → done |
 
-Hook protocol: k feeds ANSI-stripped lines to stdin. Hook exits = frame end. Path must contain `/`.
+Hook protocol: k feeds ANSI-stripped lines to stdin. Hook exits = frame end. Hook paths must include a path separator (`/`, or `\` on Windows). Path is canonicalised to absolute at `k new` time; hook must exist and be executable.
 
 ## How It Works
 
@@ -70,19 +72,54 @@ k poll
 | invariant | mechanism |
 |-----------|-----------|
 | one cell per session | O_EXCL lock, acquired before send |
-| timeout keeps lock | lock marked `timed_out`; only `k int` / `k kill` releases |
+| timeout keeps lock | lock marked `timed_out`; subsequent polls say `use k int or k kill` |
 | orphan recovery | bg PID in lock, poll checks `os.kill(pid, 0)` (POSIX) |
 | no line-wrap skew | tmux width 10000 |
 | atomic send | per-session named paste-buffer `k_{session}` |
-| ctrl-c safe | kills watcher, writes result, re-sends frame enters (repeat only) |
+| ctrl-c safe | kills watcher, writes `{"status": "error", "output": "interrupted"}`, re-sends frame enters (repeat only) |
 | session name validation | `[A-Za-z0-9_.-]+`, no `..`, no path traversal |
 | idempotent pipe restart | pipe-pane replaced on every fire/run |
 | no output classification | "done" = prompt appeared, not success |
 
+## JSON Schema (k)
+
+```
+fired:        {"cell_id": "...", "status": "fired"}
+running:      {"cell_id": "...", "status": "running"}
+done:         {"cell_id": "...", "status": "done", "output": "..."}
+timeout:      {"cell_id": "...", "status": "timeout", "output": ""}
+timeout(2+):  {"cell_id": "...", "status": "timeout", "output": "use k int or k kill"}
+error:        {"status": "error", "output": "..."}
+cell error:   {"cell_id": "...", "status": "error", "output": "..."}
+```
+
+Errors without `cell_id`: `no session 'x'`, `active cell 'x'`, `pipe failed: ...`, `no active cell on 'x'`.
+Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`.
+
+## km — event monitor
+
+```
+km <session> [cell_id] [-1]
+```
+
+Watches a session via pipe-pane. Each stdout line is one JSON event. `-1` exits after first completion (one-shot `.then()`).
+
+```
+fired:   {"cell_id": "...", "session": "...", "status": "fired",  "ts": "..."}
+done:    {"cell_id": "...", "session": "...", "status": "done",   "ts": "..."}
+notify:  {"session": "...", "status": "notify", "from": "...", "message": "...", "ts": "..."}
+closed:  {"session": "...", "status": "closed", "ts": "..."}
+error:   {"session": "...", "status": "error",  "message": "...", "ts": "..."}
+```
+
 ## Testing
 
 ```bash
-bash test.sh           # 34 tests, covers all edge cases
+python tests/test_contracts.py      # static code contracts, no tmux
+python tests/test_docs.py           # README/SKILL drift, no tmux
+bash test.sh                       # 34 tests (32 without gdb), runtime smoke suite
+python tests/test_regressions.py    # targeted audit regressions
+python tests/run_all.py             # all suites
 ```
 
 ## Files
@@ -90,7 +127,8 @@ bash test.sh           # 34 tests, covers all edge cases
 ```
 scripts/k      main script
 scripts/km     event monitor
-test.sh        test suite (34 tests)
-SKILL.md                  agent reference
-EXAMPLES.md               patterns + philosophy
+test.sh        runtime smoke suite
+tests/*.py     static, docs, and regression suites
+SKILL.md       agent reference
+EXAMPLES.md    patterns + philosophy
 ```

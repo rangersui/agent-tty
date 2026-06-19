@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Documentation drift tests for README.md and SKILL.md."""
+
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+README = (ROOT / "README.md").read_text(encoding="utf-8")
+SKILL = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+K_HELP = (ROOT / "scripts" / "k").read_text(encoding="utf-8")
+TEST_SH = (ROOT / "test.sh").read_text(encoding="utf-8")
+FAILURES: list[str] = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    if not cond:
+        FAILURES.append(f"{name}: {detail}".rstrip(": "))
+
+
+def max_runtime_checks() -> int:
+    check_calls = len(re.findall(r'^\s*check\s+"', TEST_SH, flags=re.M))
+    manual_checks = len(re.findall(r'&&\s*PASS=\$\(\(PASS\+1\)\)', TEST_SH))
+    return check_calls + manual_checks
+
+
+expected_checks = max_runtime_checks()
+
+# ── command coverage ──
+for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
+    check(f"{doc_name}: runtime check count", f"{expected_checks} tests" in text, f"expected '{expected_checks} tests'")
+    for command in ("new", "fire", "poll", "run", "await", "notify", "int", "kill", "status", "watch", "history"):
+        check(f"{doc_name}: command {command}", f"k {command}" in text)
+    for script in (
+        "tests/test_contracts.py",
+        "tests/test_docs.py",
+        "test.sh",
+        "tests/test_regressions.py",
+        "tests/run_all.py",
+    ):
+        check(f"{doc_name}: mentions {script}", script in text)
+
+check("README.md: no stale line counts", not re.search(r"scripts/(?:k|km)\s+\d+\s+lines", README))
+check("README.md: no stale test.sh line count", not re.search(r"test\.sh\s+\d+\s+lines", README))
+
+# ── option order: flags before positional args ──
+for doc_name, text in (("README.md", README), ("SKILL.md", SKILL), ("k help", K_HELP)):
+    # fire: -t must come before [session] <code>
+    check(f"{doc_name}: fire option order", bool(re.search(r"k fire\s+\[-t", text)),
+          "should be 'k fire [-t N] [session] <code>'")
+    # history: -n must come before [session]
+    check(f"{doc_name}: history option order", bool(re.search(r"k history\s+\[-n", text)),
+          "should be 'k history [-n N] [session]'")
+
+# ── removed/outdated patterns ──
+for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
+    check(f"{doc_name}: no old frame-only claim", "Frame delimiter = repeated prompt lines" not in text)
+    check(f"{doc_name}: no status=interrupted schema", '"status": "interrupted"' not in text)
+    check(f"{doc_name}: no pipe-pane -o", "pipe-pane -o" not in text)
+    check(f"{doc_name}: no /proc orphan docs", "/proc" not in text)
+    check(f"{doc_name}: no bash-wrapped Python tests", "test_contracts.sh" not in text and "test_docs.sh" not in text)
+    check(f"{doc_name}: hook uses path separator wording", "path separator" in text)
+    check(f"{doc_name}: timeout recovery documented", "use k int or k kill" in text)
+    check(f"{doc_name}: interrupted is error schema", '"status": "error", "output": "interrupted"' in text)
+
+# ── km event monitor ──
+for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
+    check(f"{doc_name}: km CLI documented", "km <session>" in text)
+    check(f"{doc_name}: km -1 flag documented", "-1" in text and "one-shot" in text.lower())
+    for km_status in ("fired", "done", "notify", "closed", "error"):
+        check(f"{doc_name}: km event '{km_status}'", f'"status": "{km_status}"' in text)
+
+# ── k JSON error outputs ──
+for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
+    for err in ("unknown cell", "watcher died", "active cell", "pipe failed", "no active cell"):
+        check(f"{doc_name}: error output '{err}'", err in text)
+    # cell errors (with cell_id) vs errors (without) are distinguished
+    check(f"{doc_name}: cell error schema", "cell error" in text)
+    without = re.search(r"Errors without `cell_id`: ([^\n]+)", text)
+    with_cell = re.search(r"Errors with `cell_id`: ([^\n]+)", text)
+    check(f"{doc_name}: errors without cell_id line exists", without is not None)
+    check(f"{doc_name}: errors with cell_id line exists", with_cell is not None)
+    if without and with_cell:
+        check(f"{doc_name}: no-active-cell is without cell_id", "no active cell" in without.group(1))
+        check(f"{doc_name}: no-active-cell not with cell_id", "no active cell" not in with_cell.group(1))
+    check(f"{doc_name}: no duplicate default 5", "(default 5) (default 5)" not in text)
+
+if FAILURES:
+    print("documentation drift failures:")
+    for failure in FAILURES:
+        print(f"  - {failure}")
+    raise SystemExit(1)
+
+print("documentation drift tests passed")

@@ -23,20 +23,19 @@ Zero config for bash/python. `--prompt` for exact match or custom hook.
 ## Commands
 
 ```
-k new    <session> <cmd...> [--prompt="x"]     spawn session
+k new    <session> [cmd...] [--prompt="x"]     spawn session (default: bash)
 k new    <session> <cmd> --prompt=./hook        hook mode
-k fire   [session] <code> [-t N]               async fire (default timeout 300s)
+k fire   [-t N] [session] <code>               async fire (default 300s)
 k poll   [session] [cell_id]                   poll result (O(1))
-k run    [session] <code>                      sync (lock + send + wait inline)
-k run -j [session] <code>                      sync, JSON output
-k run -j -t N [session] <code>                 sync, custom timeout
+k run    [-j] [-t N] [session] <code>          sync (default 30s)
+k await  ...                                   alias for run
 k notify [session] <message>                   notification (direct to log)
 k int    [session]                             ctrl-c (+ re-frame in repeat mode)
 k kill   <session>                             kill + cleanup
 k ls                                           list sessions
 k status [session]                             health check
 k watch  [session]                             live filtered view
-k history [session] [-n N]                     last N cells
+k history [-n N] [session]                     last N×5 lines (default 5)
 ```
 
 Session resolves: explicit arg > K_SESSION env > auto-detect (single session).
@@ -87,7 +86,7 @@ For REPLs where empty Enter has side effects (gdb repeats last command).
 
 ### Hook: `--prompt=./detect.py`
 
-k feeds ANSI-stripped lines to hook's stdin. Hook exits when frame ends. k pops the last line (= the boundary). Hook path must contain `/`.
+k feeds ANSI-stripped lines to hook's stdin. Hook exits when frame ends. k pops the last line (= the boundary). Hook paths must include a path separator (`/`, or `\` on Windows). The path is canonicalised to absolute at `k new` time; the hook file must exist and be executable (`chmod +x`).
 
 ```python
 #!/usr/bin/env python3
@@ -148,9 +147,13 @@ fired:        {"cell_id": "...", "status": "fired"}
 running:      {"cell_id": "...", "status": "running"}
 done:         {"cell_id": "...", "status": "done", "output": "..."}
 timeout:      {"cell_id": "...", "status": "timeout", "output": ""}
-error:        {"status": "error", "output": "no session 'x'"}
-interrupted:  {"cell_id": "...", "status": "error", "output": "interrupted"}
+timeout(2+):  {"cell_id": "...", "status": "timeout", "output": "use k int or k kill"}
+error:        {"status": "error", "output": "..."}
+cell error:   {"cell_id": "...", "status": "error", "output": "..."}
 ```
+
+Errors without `cell_id`: `no session 'x'`, `active cell 'x'`, `pipe failed: ...`, `no active cell on 'x'`.
+Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`.
 
 ## Safety Invariants
 
@@ -180,7 +183,7 @@ interrupted:  {"cell_id": "...", "status": "error", "output": "interrupted"}
 
 **echo_count heuristic**: assumes 1 sent line = 1 echoed line. Mitigated by tmux width 10000 (no wrapping) and continuation prompt filtering.
 
-**Hook mode**: no `...` filtering (user takes full control). Hook path must contain `/` to distinguish from string prompts.
+**Hook mode**: no `...` filtering (user takes full control). Hook paths must include a path separator to distinguish them from string prompts.
 
 ## Python Multi-line
 
@@ -210,9 +213,29 @@ k new redis redis-cli                          # zero config
 k new remote "ssh prod"                        # zero config
 ```
 
+## km — event monitor
+
+```
+km <session> [cell_id] [-1]
+```
+
+Watches a session via pipe-pane. Each stdout line is one JSON event. `-1` exits after first completion (one-shot `.then()`).
+
+```
+fired:   {"cell_id": "...", "session": "...", "status": "fired",  "ts": "..."}
+done:    {"cell_id": "...", "session": "...", "status": "done",   "ts": "..."}
+notify:  {"session": "...", "status": "notify", "from": "...", "message": "...", "ts": "..."}
+closed:  {"session": "...", "status": "closed", "ts": "..."}
+error:   {"session": "...", "status": "error",  "message": "...", "ts": "..."}
+```
+
 ## Testing
 
 ```bash
-bash test.sh           # 34 tests
-bash test.sh ./scripts/k  # custom path
+python tests/test_contracts.py      # static code contracts, no tmux
+python tests/test_docs.py           # README/SKILL drift, no tmux
+bash test.sh                       # 34 tests (32 without gdb), runtime smoke suite
+python tests/test_regressions.py    # targeted audit regressions
+python tests/run_all.py             # all suites
+bash test.sh ./scripts/k            # custom k path
 ```
