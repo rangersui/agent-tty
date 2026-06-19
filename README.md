@@ -1,8 +1,8 @@
-# k-kernel
+# agent-tty
 
-Structured async execution over PTY for AI agents. REPL-agnostic. Zero config.
+Persistent terminal sessions for AI agents. Drives tmux, returns JSON.
 
-Agent fires code, polls for output, gets JSON. REPL stays alive between cells. Any readline prompt works.
+The package is `agent-tty`. The CLI command is `k`, intentionally short to minimise token overhead in agent tool calls. `km` is the companion event monitor.
 
 **Requires tmux 3.0+** — k drives tmux for PTY multiplexing; it does not bundle or replace it.
 
@@ -20,14 +20,25 @@ k run -j py "print(42)"
 
 ## Install
 
+Requires: **Python 3.8+**, **tmux 3.0+**
+
 ```bash
-# requires: python 3.8+, tmux 3.0+
-git clone <repo> && cd agent-repl
+pip install agent-tty            # → k, km, agent-tty in PATH
+```
+
+Or without pip:
+
+```bash
+git clone <repo> && cd agent-tty
+./scripts/k --help               # works immediately (dev shim)
+```
+
+Or symlink into PATH:
+
+```bash
 ln -sf "$(pwd)/scripts/k"  /usr/local/bin/k
 ln -sf "$(pwd)/scripts/km" /usr/local/bin/km
 ```
-
-Or add `scripts/` to PATH: `export PATH="/path/to/agent-repl/scripts:$PATH"`
 
 ## Commands
 
@@ -51,11 +62,11 @@ k history [-n N] [session]                     last N×5 lines (default 5)
 
 Three modes via `--prompt`:
 
-| --prompt= | mode | how |
-|-----------|------|-----|
+| --prompt=     | mode   | how                                         |
+| ------------- | ------ | ------------------------------------------- |
 | *(not set)* | repeat | 5 empty Enters → 5 identical lines → done |
-| `"(gdb)"` | exact | match prompt string |
-| `./hook.py` | hook | stdin lines → hook exit → done |
+| `"(gdb)"`   | exact  | match prompt string                         |
+| `./hook.py` | hook   | stdin lines → hook exit → done            |
 
 Hook protocol: k feeds ANSI-stripped lines to stdin. Hook exits = frame end. Hook paths must include a path separator (`/`, or `\` on Windows). Path is canonicalised to absolute at `k new` time; hook must exist and be executable.
 
@@ -83,18 +94,18 @@ k poll
 
 ## Safety
 
-| invariant | mechanism |
-|-----------|-----------|
-| one cell per session | O_EXCL lock, acquired before send |
-| timeout keeps lock | lock marked `timed_out`; subsequent polls say `use k int or k kill` |
-| orphan recovery | bg PID in lock, poll checks `os.kill(pid, 0)` (POSIX) |
-| no line-wrap skew | tmux width 10000 |
-| atomic send | per-session named paste-buffer `k_{session}` |
-| ctrl-c safe | kills watcher, writes `{"status": "error", "output": "interrupted"}`, re-sends frame enters (repeat only) |
-| session name validation | `[A-Za-z0-9_.-]+`, no `..`, no path traversal |
-| idempotent pipe restart | pipe-pane replaced on every fire/run |
-| atomic result writes | tmp + fsync + `os.replace` — poll never reads partial JSON |
-| no output classification | "done" = prompt appeared, not success |
+| invariant                | mechanism                                                                                                   |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| one cell per session     | O_EXCL lock, acquired before send                                                                           |
+| timeout keeps lock       | lock marked `timed_out`; subsequent polls say `use k int or k kill`                                     |
+| orphan recovery          | bg PID in lock, poll checks `os.kill(pid, 0)` (POSIX)                                                     |
+| no line-wrap skew        | tmux width 10000                                                                                            |
+| atomic send              | per-session named paste-buffer `k_{session}`                                                              |
+| ctrl-c safe              | kills watcher, writes `{"status": "error", "output": "interrupted"}`, re-sends frame enters (repeat only) |
+| session name validation  | `[A-Za-z0-9_.-]+`, no `..`, no path traversal                                                           |
+| idempotent pipe restart  | pipe-pane replaced on every fire/run                                                                        |
+| atomic result writes     | tmp + fsync +`os.replace` — poll never reads partial JSON                                                |
+| no output classification | "done" = prompt appeared, not success                                                                       |
 
 ## JSON Schema (k)
 
@@ -132,7 +143,7 @@ error:   {"session": "...", "status": "error",  "message": "...", "ts": "..."}
 ```bash
 python tests/test_contracts.py      # static code contracts, no tmux
 python tests/test_docs.py           # README/SKILL drift, no tmux
-bash test.sh                       # 34 tests (32 without gdb), runtime smoke suite
+bash tests/test.sh                  # 34 tests (32 without gdb), runtime smoke suite
 python tests/test_regressions.py    # targeted audit regressions
 python tests/run_all.py             # all suites
 ```
@@ -140,10 +151,12 @@ python tests/run_all.py             # all suites
 ## Files
 
 ```
-scripts/k      main script
-scripts/km     event monitor
-test.sh        runtime smoke suite
-tests/*.py     static, docs, and regression suites
-SKILL.md       agent reference
-EXAMPLES.md    patterns + philosophy
+src/agent_tty/cli.py       k — main script
+src/agent_tty/monitor.py   km — event monitor
+scripts/k, scripts/km      dev shims (no pip install needed)
+pyproject.toml             pip install agent-tty → agent-tty, k, km in PATH
+tests/test.sh              runtime smoke suite
+tests/*.py                 static, docs, and regression suites
+SKILL.md                   agent reference
+EXAMPLES.md                patterns + philosophy
 ```

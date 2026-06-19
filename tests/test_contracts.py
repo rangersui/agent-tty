@@ -5,8 +5,8 @@ import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-K_PATH = ROOT / "scripts" / "k"
-KM_PATH = ROOT / "scripts" / "km"
+K_PATH = ROOT / "src" / "agent_tty" / "cli.py"
+KM_PATH = ROOT / "src" / "agent_tty" / "monitor.py"
 K_SRC = K_PATH.read_text(encoding="utf-8")
 KM_SRC = KM_PATH.read_text(encoding="utf-8")
 FAILURES: list[str] = []

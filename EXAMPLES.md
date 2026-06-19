@@ -1,4 +1,4 @@
-# k-kernel: Persistent REPL Patterns
+# agent-tty: Persistent REPL Patterns
 
 ## Core Principle
 

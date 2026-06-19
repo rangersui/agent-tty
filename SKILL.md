@@ -1,4 +1,12 @@
-# k-kernel — REPL-agnostic cell execution for AI agents
+# agent-tty — REPL-agnostic cell execution for AI agents
+
+## Install
+
+```bash
+pip install agent-tty            # → k, km, agent-tty in PATH
+```
+
+Or without pip: `./scripts/k` works immediately (dev shim, no install needed).
 
 ## When to use
 
@@ -237,8 +245,8 @@ error:   {"session": "...", "status": "error",  "message": "...", "ts": "..."}
 ```bash
 python tests/test_contracts.py      # static code contracts, no tmux
 python tests/test_docs.py           # README/SKILL drift, no tmux
-bash test.sh                       # 34 tests (32 without gdb), runtime smoke suite
+bash tests/test.sh                  # 34 tests (32 without gdb), runtime smoke suite
 python tests/test_regressions.py    # targeted audit regressions
 python tests/run_all.py             # all suites
-bash test.sh ./scripts/k            # custom k path
+bash tests/test.sh ./scripts/k       # custom k path
 ```

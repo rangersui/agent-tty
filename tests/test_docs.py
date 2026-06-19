@@ -7,8 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 SKILL = (ROOT / "SKILL.md").read_text(encoding="utf-8")
-K_HELP = (ROOT / "scripts" / "k").read_text(encoding="utf-8")
-TEST_SH = (ROOT / "test.sh").read_text(encoding="utf-8")
+K_HELP = (ROOT / "src" / "agent_tty" / "cli.py").read_text(encoding="utf-8")
+TEST_SH = (ROOT / "tests" / "test.sh").read_text(encoding="utf-8")
+CI = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8") if (ROOT / ".github" / "workflows" / "ci.yml").exists() else ""
 FAILURES: list[str] = []
 
 
@@ -33,7 +34,7 @@ for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
     for script in (
         "tests/test_contracts.py",
         "tests/test_docs.py",
-        "test.sh",
+        "tests/test.sh",
         "tests/test_regressions.py",
         "tests/run_all.py",
     ):
@@ -41,6 +42,25 @@ for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
 
 check("README.md: no stale line counts", not re.search(r"scripts/(?:k|km)\s+\d+\s+lines", README))
 check("README.md: no stale test.sh line count", not re.search(r"test\.sh\s+\d+\s+lines", README))
+check("repo: runtime test lives under tests", (ROOT / "tests" / "test.sh").exists())
+check("repo: no root test.sh", not (ROOT / "test.sh").exists())
+
+# ── CI coverage ──
+check("CI: workflow exists", bool(CI))
+for os_name in ("ubuntu-latest", "macos-latest", "windows-latest"):
+    check(f"CI: covers {os_name}", os_name in CI)
+for action in ("actions/checkout@v6", "actions/setup-python@v6"):
+    check(f"CI: uses {action}", action in CI)
+for needle in (
+    "python tests/test_contracts.py",
+    "python tests/test_docs.py",
+    "python -m build",
+    "python -m twine check dist/*",
+    "python tests/run_all.py k",
+    "bash",
+    "tmux",
+):
+    check(f"CI: includes {needle}", needle in CI)
 
 # ── option order: flags before positional args ──
 for doc_name, text in (("README.md", README), ("SKILL.md", SKILL), ("k help", K_HELP)):

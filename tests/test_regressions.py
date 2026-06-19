@@ -11,10 +11,15 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-K_PATH = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "scripts" / "k"
-if not K_PATH.is_absolute():
-    K_PATH = ROOT / K_PATH
-K_CMD = [sys.executable, str(K_PATH)]
+K_ARG = sys.argv[1] if len(sys.argv) > 1 else str(ROOT / "scripts" / "k")
+K_PATH = Path(K_ARG)
+
+if K_PATH.is_absolute() or os.sep in K_ARG or (os.altsep and os.altsep in K_ARG) or K_PATH.exists():
+    if not K_PATH.is_absolute():
+        K_PATH = ROOT / K_PATH
+    K_CMD = [sys.executable, str(K_PATH)]
+else:
+    K_CMD = [K_ARG]
 PASS = 0
 FAIL = 0
 

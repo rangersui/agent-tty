@@ -1,6 +1,6 @@
 #!/bin/bash
-# k-kernel test suite
-# Usage: bash test.sh [path/to/k]
+# agent-tty test suite
+# Usage: bash tests/test.sh [path/to/k]
 
 K="${1:-scripts/k}"
 PASS=0
@@ -25,7 +25,7 @@ cleanup() { for s in "$@"; do $K kill "$s" 2>/dev/null; done; }
 reset() { for s in w p d; do rm -rf /tmp/k_cells/$s; tmux kill-session -t $s 2>/dev/null; done; }
 
 # ═══════════════════════════════════════════
-echo "═══ k-kernel test suite ═══"
+echo "═══ agent-tty test suite ═══"
 echo ""
 
 # ── BASH BASICS ──
