@@ -159,7 +159,13 @@ WSL is fine; native Windows fails fast.
 
 **Hook mode**: no `...` filtering (user takes full control). Hook paths must include a path separator to distinguish them from string prompts.
 
-**Python 3.13+ `_pyrepl`**: The new Python REPL auto-indents pasted code, doubling indentation on multi-line blocks. Workaround: `k new py "env PYTHON_BASIC_REPL=1 python3 -i"`. Single-line code is unaffected.
+**Line-protocol vs screen-redraw REPLs**: line-protocol REPLs (bash,
+python3 -i classic, sqlite3, node) emit clean newline-delimited output —
+framing works reliably. Screen-redraw REPLs (IPython, Python 3.13+ `_pyrepl`)
+emit raw terminal control sequences instead of text: cursor hides, color codes,
+double prompt redraws. After ANSI strip a single prompt becomes
+`In [4]: In [4]:` — broken framing. `PYTHON_BASIC_REPL=1` switches Python 3.13+
+back to line-protocol mode — always use it for agent work surfaces.
 
 ## Python Multi-line
 

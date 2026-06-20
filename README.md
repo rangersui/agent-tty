@@ -32,7 +32,7 @@ k run -j work "echo hello"
 # {"cell_id":"...","status":"done","output":"hello"}
 
 k new py python3 -i                         # Python 3.12 and below
-k new py "env PYTHON_BASIC_REPL=1 python3 -i"  # Python 3.13+ (disables _pyrepl auto-indent)
+k new py "env PYTHON_BASIC_REPL=1 python3 -i"  # Python 3.13+ (line-protocol mode)
 k run -j py "print(42)"
 ```
 
@@ -219,7 +219,37 @@ is a separate limitation that still applies regardless of how code is sent.
 
 **Hook mode**: no `...` filtering (user takes full control). Hook paths must include a path separator to distinguish them from string prompts.
 
-**Python 3.13+ `_pyrepl`**: The new Python REPL auto-indents pasted code, doubling indentation on multi-line blocks. Workaround: `k new py "env PYTHON_BASIC_REPL=1 python3 -i"`. Single-line code is unaffected.
+**Line-protocol vs screen-redraw REPLs**: agent-tty's frame detection assumes a
+*line-protocol* REPL — one that emits output as clean lines ending with a stable
+prompt (`>>> `, `sqlite> `, `$ `). bash, python3 -i (classic), sqlite3, and node
+all work this way: their output is mostly clean text with stable prompts.
+
+Some REPLs are *screen-redraw UIs* instead. IPython and Python 3.13+'s `_pyrepl`
+are the most common examples. The distinction matters because of what `pipe-pane`
+actually delivers: not rendered text, but raw terminal control sequences. A single
+IPython prompt redraw looks like this in the pipe-pane stream:
+
+```
+^[[?25l^[[?7l^[[8D^[[0m^[[J^[[0;32mIn [^[[0;92;1m4^[[0;32m]: ...
+```
+
+Cursor hides, resets, redraws the prompt in color, moves the cursor back and
+forth, then does the whole thing again. One empty Enter redraws the prompt twice.
+After ANSI stripping and line splitting, you get `In [4]: In [4]:` — doubled
+prompts, phantom lines, and broken framing. The assumption that "output is text
+lines separated by newlines" is false here; `pipe-pane` is delivering VT100 draw
+instructions, not text. (`capture-pane` renders first, so it returns clean
+`In [4]:` — but k reads `pipe-pane`.)
+
+`PYTHON_BASIC_REPL=1` is not just an auto-indent workaround — it switches Python
+3.13+ back to the classic line-protocol REPL. For agent work surfaces, always
+prefer line-protocol REPLs:
+
+```bash
+k new py python3 -i                          # Python 3.12 and below (already line-protocol)
+k new py "env PYTHON_BASIC_REPL=1 python3 -i" # Python 3.13+ (switch back to line-protocol)
+# avoid: k new py ipython                     # screen-redraw UI, unreliable framing
+```
 
 ## km — callback monitor
 

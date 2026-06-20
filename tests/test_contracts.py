@@ -252,12 +252,18 @@ check("prompt: string mode strips whitespace", "prompt = prompt.strip()" in new_
 check("prompt: empty after strip is rejected", "ERR empty prompt" in new_seg)
 check("_create: no redundant prompt strip", "prompt.strip()" not in create_seg,
       "_create should store prompt as-is; normalisation belongs in cmd_new")
-check("exact match: capture-pane fallback for pipe buffering",
-      "_pane_shows_prompt(session, prompt)" in stream_seg,
-      "exact match needs capture-pane polling; pipe-pane buffers prompts without trailing newline")
-check("exact match: capture-pane is rate-limited",
+check("capture-pane fallback for pipe buffering",
+      "_pane_last_visible(session)" in stream_seg,
+      "exact/hook modes need capture-pane polling; pipe-pane buffers prompts without trailing newline")
+check("capture-pane: rate-limited",
       "_PANE_POLL_INTERVAL" in K_SRC and "last_pane_poll" in stream_seg,
       "capture-pane polling must be throttled to avoid hammering tmux")
+check("capture-pane: hook probe dedup",
+      "last_hook_probe" in stream_seg,
+      "same visible line must not be fed to hook repeatedly")
+check("capture-pane: hook probe BrokenPipe pops boundary",
+      "BrokenPipeError" in stream_seg and stream_seg.count("if output and last_appended") >= 2,
+      "probe path must pop boundary on BrokenPipe, same as log path")
 
 main_seg = segment(K_SRC, main)
 check("new: reports create failure without traceback", "ERR create failed" in new_seg)

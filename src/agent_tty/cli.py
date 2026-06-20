@@ -612,28 +612,28 @@ class CellLock:
 # (= REPL redrawing prompt on empty Enter)
 # ═══════════════════════════════════════════
 
-_PANE_POLL_INTERVAL = 0.3   # seconds between capture-pane checks (exact match only)
+_PANE_POLL_INTERVAL = 0.3   # seconds between capture-pane checks (exact/hook fallback)
 
-def _pane_shows_prompt(session: str, prompt: str) -> bool:
-    """Check if the last non-empty line on the tmux pane matches the prompt.
+def _pane_last_visible(session: str) -> str | None:
+    """Return the last non-empty visible line on the tmux pane, or None.
 
     tmux pipe-pane buffers data internally and only flushes on newline-
     bearing writes.  REPL prompts sit without a trailing newline, so they
     appear on screen but never reach the log file.  This function reads the
-    live pane content via ``capture-pane`` as a reliable fallback for exact-
-    match completion detection.
+    live pane content via ``capture-pane`` — used by both exact-match and
+    hook modes as a fallback when the log goes silent.
     """
     r = subprocess.run(
         [TMUX, "capture-pane", "-t", session, "-p"],
         capture_output=True, text=True,
     )
     if r.returncode != 0:
-        return False
+        return None
     for line in reversed(r.stdout.split("\n")):
         clean = ANSI_RE.sub("", line).strip()
         if clean:
-            return clean == prompt
-    return False
+            return clean
+    return None
 
 def _stream_process(
     session: str,
@@ -669,6 +669,7 @@ def _stream_process(
     last_appended = False  # tracks if last line was appended (not filtered)
     timed_out = False
     last_pane_poll = 0.0   # monotonic time of last capture-pane check
+    last_hook_probe: str | None = None  # dedup: last line probed via capture-pane
 
     try:
         with _open_private(logpath, os.O_RDONLY, "r", errors="replace") as f:
@@ -686,30 +687,55 @@ def _stream_process(
                             output.pop()
                         break
 
-                    # Exact match fallback: tmux pipe-pane buffers prompts
-                    # that lack a trailing newline.  Poll capture-pane so we
-                    # can still detect the prompt on screen.
-                    if prompt and state == "OUTPUT":
+                    # Pipe silent — capture-pane fallback.
+                    # tmux pipe-pane buffers prompts that lack trailing
+                    # newline.  Poll capture-pane for the last visible line
+                    # and either match it ourselves (exact) or feed it to
+                    # the hook (hook mode).
+                    if state == "OUTPUT":
                         now = time.monotonic()
                         if now - last_pane_poll >= _PANE_POLL_INTERVAL:
                             last_pane_poll = now
-                            if _pane_shows_prompt(session, prompt):
-                                # drain any remaining log lines into output
-                                while True:
-                                    extra = f.readline()
-                                    if not extra:
-                                        break
-                                    ec = ANSI_RE.sub("", extra).strip()
-                                    if not ec:
-                                        continue
-                                    if CELL_EVENT_RE.match(ec) or NOTIFY_EVENT_RE.match(ec):
-                                        continue
-                                    if ec == prompt:
-                                        break
-                                    if ec == "..." or ec.startswith("... "):
-                                        continue
-                                    output.append(ec)
-                                break  # prompt found — frame done
+                            visible = _pane_last_visible(session)
+                            if visible:
+                                if hook:
+                                    # hook mode: feed visible line as probe
+                                    # (don't append to output — it's a probe,
+                                    # not a log-sourced line)
+                                    if visible != last_hook_probe:
+                                        last_hook_probe = visible
+                                        assert hook.stdin is not None
+                                        try:
+                                            hook.stdin.write(visible + "\n")
+                                            hook.stdin.flush()
+                                        except (BrokenPipeError, OSError):
+                                            # hook already exited — same
+                                            # boundary-pop as log path
+                                            if output and last_appended:
+                                                output.pop()
+                                            break
+                                        time.sleep(0.01)
+                                        if hook.poll() is not None:
+                                            break  # hook accepted the probe
+                                elif prompt and visible == prompt:
+                                    # exact match: drain remaining log lines
+                                    while True:
+                                        extra = f.readline()
+                                        if not extra:
+                                            break
+                                        ec = ANSI_RE.sub("", extra).strip()
+                                        if not ec:
+                                            continue
+                                        if CELL_EVENT_RE.match(ec) or NOTIFY_EVENT_RE.match(ec):
+                                            continue
+                                        if ec == prompt:
+                                            break
+                                        if ec == "..." or ec.startswith("... "):
+                                            continue
+                                        if ec.startswith(prompt + " "):
+                                            continue
+                                        output.append(ec)
+                                    break  # prompt found — frame done
 
                     time.sleep(0.05)
                     continue
@@ -749,6 +775,10 @@ def _stream_process(
                         if clean == prompt:
                             break
                         if clean == "..." or clean.startswith("... "):
+                            continue
+                        # filter echoed input: prompt + typed text (e.g.
+                        # ">>> x = 99" or _pyrepl per-keystroke redraws)
+                        if clean.startswith(prompt + " "):
                             continue
                         output.append(clean)
                     else:
