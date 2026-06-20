@@ -24,6 +24,23 @@ ticks, frame noise hidden — or `tmux attach` for native raw takeover.
 `km` calls your agent back when a long cell finishes.
 `k poll` is a simple fallback for runtimes without monitor/interrupt support.
 
+Every agent-tty command is something you already do at a terminal:
+
+```
+k new      you open a terminal
+k run      you type a command and watch it finish
+k fire     you start a build and go get coffee
+k poll     you come back and check if it's done
+k int      you hit Ctrl-C
+k kill     you close the terminal
+k ls       you check how many terminal windows you have open
+k status   you glance at a terminal — running or dead?
+k watch    you sit down and watch output scroll
+k history  you scroll up to see what ran before
+k notify   you stick a note on a colleague's desk: "build's done"
+km         you set an alarm to go off when the build finishes
+```
+
 ## Quick Start
 
 ```bash
