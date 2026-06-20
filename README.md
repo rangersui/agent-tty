@@ -1,5 +1,7 @@
 # agent-tty
 
+*tmux is all u need: a boring old terminal multiplexer becomes an agent runtime primitive.*
+
 A persistent TTY for your AI agent. Shared live terminal for humans.
 
 bash_tool runs a command and forgets. agent-tty gives your agent a
