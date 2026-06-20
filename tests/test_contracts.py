@@ -236,11 +236,15 @@ check("main: parses user numbers via helper", "_parse_positive_int(rest[1], \"-t
 check("main: no bare int() on user rest values", "timeout = int(" not in main_seg and "n = int(" not in main_seg)
 check("_stream_process: timeout zero is not infinite", "timeout if timeout is not None else None" in stream_seg and "deadline is not None" in stream_seg)
 check("sentinel exceptions: warn before returning fallback", all(needle in K_SRC for needle in (
-    "_warn(f\"lock update failed",
+    "_warn(f\"lock read failed",
+    "_warn(f\"lock write failed",
+    "_warn(f\"lock file missing",
+    "_warn(f\"corrupt lock shape",
     "_warn(f\"session metadata prompt read failed",
     "_warn(f\"session metadata command read failed",
     "_warn(f\"active lock read failed",
-    "_warn(f\"active cell read failed",
+    "_warn(f\"corrupt lock JSON",
+    "_warn(f\"lock read IO error",
     "_warn(f\"lock release check failed",
     "_warn(f\"lock release failed",
 )))

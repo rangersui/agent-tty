@@ -138,6 +138,7 @@ class LockBusy(Exception):
 class LockGuard:
     """Proof token: caller holds the per-session lock-file mutex."""
     def __init__(self, session, blocking=True):
+        validate_name(session)
         self.session = session
         self.blocking = blocking
         self._f = None
@@ -299,22 +300,32 @@ def _update_lock(session, cell_id=None, *, blocking=True, **kw):
         return False
 
 def _update_lock_unlocked(session, cell_id=None, **kw):
+    lock = _lock(session)
     try:
-        lock = _lock(session)
         with _open_private(lock, os.O_RDONLY, "r") as f:
             meta = json.load(f)
-        if cell_id is not None and meta.get("cell_id") != cell_id:
-            return False
-        meta.update(kw)
-        tmp = lock + ".tmp"
+    except FileNotFoundError:
+        _warn(f"lock file missing for {session}")
+        return False
+    except (json.JSONDecodeError, OSError) as e:
+        _warn(f"lock read failed for {session}: {e}")
+        return False
+    if not isinstance(meta, dict):
+        _warn(f"corrupt lock shape for {session}: expected dict, got {type(meta).__name__}")
+        return False
+    if cell_id is not None and meta.get("cell_id") != cell_id:
+        return False
+    meta.update(kw)
+    tmp = lock + ".tmp"
+    try:
         with _open_private(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, "w") as f:
             json.dump(meta, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, lock)
         return True
-    except Exception as e:
-        _warn(f"lock update failed for {session}: {e}")
+    except OSError as e:
+        _warn(f"lock write failed for {session}: {e}")
         return False
 
 def _terminal_fields(status):
@@ -440,12 +451,19 @@ def _acquire_unlocked(session, cell_id, log_offset, echo_count):
 
 def _load_cell(session):
     try:
-        with _open_private(_lock(session), os.O_RDONLY, "r") as f: return json.load(f)
+        with _open_private(_lock(session), os.O_RDONLY, "r") as f: meta = json.load(f)
     except FileNotFoundError:
         return None
-    except Exception as e:
-        _warn(f"active cell read failed for {session}: {e}")
+    except json.JSONDecodeError as e:
+        _warn(f"corrupt lock JSON for {session}: {e}")
         return None
+    except OSError as e:
+        _warn(f"lock read IO error for {session}: {e}")
+        return None
+    if not isinstance(meta, dict):
+        _warn(f"corrupt lock shape for {session}: expected dict, got {type(meta).__name__}")
+        return None
+    return meta
 
 def _release(session, cell_id):
     with LockGuard(session):
