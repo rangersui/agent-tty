@@ -135,6 +135,19 @@ k poll work                    # → {"status": "error", "output": "interrupted"
 
 `k int` interrupts the active cell, writes an `error`/`interrupted` result for it, and releases the session so new commands can run.
 
+**Live connections and Ctrl-C**: `k int` sends Ctrl-C to the REPL process. Pure data in memory (variables, lists, dicts) survives. Live connections to external processes (Playwright/CDP, database handles, WebSockets) may not — some libraries (notably Playwright's sync API over asyncio) cannot re-establish connections in the same process after a KeyboardInterrupt corrupts their event loop. If you hold live connections, prefer `k fire` + `km -1` over `k run` for long operations, and checkpoint important state to files before interrupting.
+
+**Worker isolation for fragile handles**: when you need durable agent state while using fragile live connections (browser/CDP, long-lived database pool, GPU model), run two k sessions:
+
+```
+ctrl  (durable)   — holds data, findings, plan; never imports the fragile library
+worker (disposable) — holds the live connection; runs a socket server on main thread
+```
+
+The ctrl session sends code strings to the worker via Unix socket; the worker `exec`s them and writes results to a shared file or socket. If the worker's connection dies, `k kill worker && k new worker` and relaunch — ctrl's data is untouched.
+
+Key constraint: Playwright's sync API uses greenlets bound to the main thread. A threaded socket server fails with `cannot switch to a different thread`. The worker must handle requests serially on the main thread. This applies to any library that assumes single-threaded event loop ownership (asyncio, greenlet, some GPU runtimes).
+
 ## JSON Schema
 
 ```
