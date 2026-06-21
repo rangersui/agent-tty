@@ -1,6 +1,5 @@
 # agent-tty local precedent index
 # Project-specific precedents only.
-# Universal precedents live in agent-compact.
 
 - id: event-spoof-accepted
   holding: Event spoofing via pane output is accepted risk for this tool.
@@ -8,6 +7,7 @@
   tags: [security, threat-model, accepted-risk, cli]
   severity: P3
   status: accepted_risk
+  date: 2026-06-20
 
 - id: status-no-side-effects
   holding: Health/status commands must not inject keystrokes into the target session.
@@ -15,3 +15,28 @@
   tags: [cli, side-effects, status, health-check]
   severity: P2
   status: active
+  date: 2026-06-20
+
+- id: unicode-encoding-safety
+  holding: CLI help text must stay within ASCII — cp1252 crashes on Unicode.
+  applies_when: writing help text, docstrings, or user-facing CLI output
+  tags: [cli, encoding, windows, cross-platform]
+  severity: P1
+  status: active
+  date: 2026-06-20
+
+- id: pypi-version-immutable
+  holding: PyPI versions are immutable — always bump before re-releasing.
+  applies_when: releasing Python packages to PyPI
+  tags: [release, pypi, versioning]
+  severity: P1
+  status: active
+  date: 2026-06-20
+
+- id: research-before-guessing
+  holding: Research source before adapting unfamiliar APIs.
+  applies_when: adapting unfamiliar API, library, or tool
+  tags: [research, api, integration]
+  severity: P2
+  status: active
+  date: 2026-06-19
