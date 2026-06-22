@@ -21,6 +21,8 @@ python -m pip install agent-tty
 k --version
 ```
 
+After install, `k` is the complete CLI. Do not edit `k`.
+
 From a source checkout, install editable once so `k` resolves to this tree:
 
 ```bash
@@ -155,7 +157,7 @@ with the session the human can attach to.
 Use the host shell as plumbing:
 
 - start or stop the daemon,
-- copy `k.py.template` to `k.py` and fill in the token,
+- set `K_TOKEN` in TCP mode,
 - write larger Python cells to files before loading them,
 - inspect or repair the repository when no session is available.
 
@@ -294,10 +296,11 @@ On Linux/macOS (when using TCP explicitly):
 export K_TOKEN=abc123...
 ```
 
-Attach uses the same token in TCP mode, so the `k attach` client or `k.py`
-wrapper must have `K_TOKEN` set.
+Attach uses the same token in TCP mode, so the client shell running `k attach`
+or other `k` commands must have `K_TOKEN` set.
 
-Use `k.py.template` to make TCP commands short:
+In a source checkout, `k.py.template` is an optional convenience wrapper for
+storing a local daemon token:
 
 ```bash
 cp k.py.template k.py

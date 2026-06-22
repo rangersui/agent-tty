@@ -14,6 +14,8 @@ python -m pip install agent-tty
 k --version
 ```
 
+After install, `k` is ready. Do not edit the generated `k` command.
+
 From a source checkout, use editable install once:
 
 ```bash
@@ -140,8 +142,8 @@ agent-tty uses the best local console surface available:
 | WinPTY | Windows with `pywinpty` | raw terminal through WinPTY |
 | socket console | fallback | line-based `InteractiveConsole` over local TCP |
 
-Windows uses TCP transport. The daemon prints a token; set `K_TOKEN` or use a
-filled-in `k.py` wrapper before running client commands or `attach`.
+Windows uses TCP transport. The daemon prints a token; set `K_TOKEN` in the
+client shell before running commands or `attach`.
 
 ## Commands
 
@@ -161,8 +163,7 @@ k attach <name>           attach human REPL to the session
 k --version|-V|version    print version
 ```
 
-In TCP mode, copy `k.py.template` to `k.py`, paste the daemon token into it,
-then use:
+In a source checkout, `k.py.template` is an optional local wrapper for TCP mode:
 
 ```bash
 python k.py ...
@@ -218,8 +219,8 @@ AF_UNIX mode uses filesystem-local `K_SOCK`, default `/tmp/k.sock`.
 TCP mode uses `127.0.0.1:K_PORT` (default 7399) and requires `K_TOKEN`. The
 daemon prints the token at startup (`set K_TOKEN=...` on Windows,
 `export K_TOKEN=...` on Linux/macOS). Attach uses the same token.
-`k.py.template` is the local wrapper template for storing that token in an
-ignored `k.py` file.
+After pip install, use `k` directly; do not edit it. Source checkouts also
+include `k.py.template` for storing a token in an ignored local `k.py` file.
 
 On Windows, WinPTY mode requires `pywinpty`. With `pywinpty` available the daemon
 prints `mode=winpty`; otherwise it falls back to `mode=socket`.

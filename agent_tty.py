@@ -21,8 +21,9 @@ Human interaction:
 Transport:
   - AF_UNIX mode uses filesystem-local K_SOCK, default /tmp/k.sock.
   - TCP mode uses 127.0.0.1:K_PORT and requires K_TOKEN.
-  - The daemon prints the token; k.py.template is a local wrapper template that
-    stores K_TOKEN/K_PORT so agent calls stay short.  The real k.py is ignored.
+  - After pip install, the generated k command is complete; do not edit it.
+  - For TCP clients, set K_TOKEN in the client shell.  Source checkouts also
+    include k.py.template as an optional local wrapper.
 
 Commands:
     k daemon                  start daemon in foreground
