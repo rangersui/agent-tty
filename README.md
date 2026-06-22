@@ -221,10 +221,59 @@ operations:
   same namespace.
 - Host commands: use `subprocess.run(..., capture_output=True, text=True)` from
   inside the session when you need the OS.
+- Persistent subprocess: need a long-lived bash, node, or gdb? Start it with
+  `Popen` and keep it in the namespace. State accumulates across agent turns.
 
 The REPL is Turing complete. File watchers, completion callbacks, local
 monitors, proxy servers, and control loops do not need to be built into
 agent-tty; the session can build them as Python code.
+
+### Persistent subprocess
+
+The session can host long-lived child processes. A persistent bash inside the
+persistent Python REPL gives you shell state (cd, env vars, aliases) that
+survives across agent turns:
+
+```bash
+k run work "
+from subprocess import Popen, PIPE, STDOUT
+import queue, threading, time
+
+shell = Popen(['bash'], stdin=PIPE, stdout=PIPE, stderr=STDOUT, text=True, bufsize=1)
+_q = queue.Queue()
+threading.Thread(target=lambda: [_q.put(l) for l in shell.stdout], daemon=True).start()
+
+def sh(cmd, timeout=5):
+    marker = f'__DONE_{time.monotonic_ns()}__'
+    shell.stdin.write(f'{cmd}\necho {marker}\n')
+    shell.stdin.flush()
+    lines, deadline = [], time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            line = _q.get(timeout=0.1)
+            if line is None or marker in line: break
+            lines.append(line.rstrip())
+        except queue.Empty: continue
+    return chr(10).join(lines)
+"
+```
+
+Now bash state persists:
+
+```bash
+k run work "print(sh('cd /tmp && pwd'))"
+# /tmp
+
+k run work "print(sh('pwd'))"
+# /tmp  ← cd persisted
+
+k run work "print(sh('export SECRET=hunter2'))"
+k run work "print(sh('echo \$SECRET'))"
+# hunter2  ← env var persisted
+```
+
+The same pattern works for any interactive subprocess: node, gdb, redis-cli,
+psql. The Python session is the host; everything else lives inside it.
 
 ## Output Formats
 

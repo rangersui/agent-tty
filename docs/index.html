@@ -374,6 +374,23 @@ threading.Thread(target=on_done, daemon=True).start()
       <p>Need the host OS? <code>subprocess.run(["git","status"], capture_output=True, text=True).stdout</code> &mdash; host commands return clean strings inside the session.</p>
     </div>
   </div>
+  <div class="terminal inline">
+    <div class="terminal-bar">
+      <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
+      <span class="term-title">persistent bash inside persistent python</span>
+    </div>
+    <div class="terminal-body"><span class="comment"># start a long-lived bash with a helper to send commands</span>
+<span class="prompt">$ </span><span class="cmd">k run work "exec(open('/tmp/persistent_shell.py').read())"</span>
+<span class="out">persistent bash pid=976 ready. use sh('command')</span>
+
+<span class="comment"># bash state persists across agent turns</span>
+<span class="prompt">$ </span><span class="cmd">k run work "print(sh('cd /tmp &amp;&amp; pwd'))"</span>
+<span class="out">/tmp</span>
+<span class="prompt">$ </span><span class="cmd">k run work "print(sh('pwd'))"</span>
+<span class="out">/tmp</span>
+<span class="comment"># ↑ remembered &mdash; cd persisted</span></div>
+  </div>
+  <p class="insight">Need bash? It's a subprocess. Need node? Same. Need gdb? Same. The Python session is the host. Everything else lives inside it.</p>
 </section>
 
 <!-- ═══ COMMAND MAP ═══ -->
