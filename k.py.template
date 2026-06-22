@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """k.py -- local token wrapper for the installed k command.
 
-In TCP mode, the daemon generates a random token at startup and prints it to
-stderr:
+TCP clients normally discover the daemon token from private daemon.json
+metadata, so this wrapper is not needed for normal use.
 
-    k daemon pid=12345 127.0.0.1:7399 mode=socket token=abc123...
+For debugging or unusual shells, start the daemon with --show-token:
 
-Windows:
-
+    k daemon --show-token
     set K_TOKEN=abc123...
 
-Linux/macOS TCP:
-
-    export K_TOKEN=abc123...
-
-Copy that token into K_TOKEN below, and set K_PORT to match.  Save this file as
-k.py.  Then use the wrapper for short local commands:
+Copy that token into K_TOKEN below, and set K_PORT to match. Save this file as
+k.py. Then use the wrapper for short local commands:
 
     python k.py ls
     python k.py new default
@@ -28,9 +23,9 @@ commands are already short:
     k ls
 
 Why this file exists:
-  TCP clients authenticate with K_TOKEN.  On Windows, every new terminal would
-  otherwise need another "set K_TOKEN=..." command.  This wrapper supplies those
-  vars for each local command, then delegates to the installed k entry point.
+  k normally discovers TCP daemon metadata automatically from daemon.json.  This
+  wrapper is only a fixed-token debug/convenience path: it supplies K_TOKEN and
+  K_PORT for each local command, then delegates to the installed k entry point.
 
 Security:
   k.py contains a live daemon token.  It is intentionally listed in .gitignore.
@@ -38,7 +33,7 @@ Security:
 """
 import os, sys, subprocess
 
-# Paste the token from daemon stderr output here.
+# Paste the token from `k daemon --show-token` stderr output here.
 K_TOKEN = "PASTE_TOKEN_HERE"
 
 # The TCP port the daemon listens on (default 7399).

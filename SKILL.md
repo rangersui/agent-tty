@@ -101,7 +101,7 @@ k daemon
 ```
 
 Stop the daemon with `Ctrl-C` in the daemon terminal. Shutdown terminates owned
-sessions and closes the control socket.
+sessions, closes the control socket, and removes TCP `daemon.json` metadata.
 
 Create a session and prove state persists:
 
@@ -142,13 +142,13 @@ agent-tty uses the best local console surface available:
 | WinPTY | Windows with `pywinpty` | raw terminal through WinPTY |
 | socket console | fallback | line-based `InteractiveConsole` over local TCP |
 
-Windows uses TCP transport. The daemon prints a token; set `K_TOKEN` in the
-client shell before running commands or `attach`.
+Windows uses TCP transport. The daemon writes a private metadata file so client
+shells can discover the token automatically.
 
 ## Commands
 
 ```text
-k daemon                  start daemon in foreground
+k daemon [--show-token]   start daemon in foreground
 k new <name>              create a Python session
 k int <name>              interrupt running async cells
 k kill <name>             terminate session process and forget it
@@ -163,7 +163,7 @@ k attach <name>           attach human REPL to the session
 k --version|-V|version    print version
 ```
 
-In a source checkout, `k.py.template` is an optional local wrapper for TCP mode:
+In a source checkout, `k.py.template` is an optional debug wrapper for TCP mode:
 
 ```bash
 python k.py ...
@@ -185,7 +185,7 @@ python k.py ...
 | `k vars` | JSON | `{"vars":["name", ...]}` |
 | `k complete` | JSON | `{"matches":["os.path", ...]}` |
 | `k attach` | stream | interactive console |
-| `k --version` | text | `agent-tty 0.2.0`; aliases: `k -V`, `k version` |
+| `k --version` | text | `agent-tty 0.2.1`; aliases: `k -V`, `k version` |
 
 `k run` prints expression results. Strings print as raw text; other values use
 `repr`. Assignments normally produce empty output.
@@ -216,11 +216,21 @@ exist.
 
 AF_UNIX mode uses filesystem-local `K_SOCK`, default `/tmp/k.sock`.
 
-TCP mode uses `127.0.0.1:K_PORT` (default 7399) and requires `K_TOKEN`. The
-daemon prints the token at startup (`set K_TOKEN=...` on Windows,
-`export K_TOKEN=...` on Linux/macOS). Attach uses the same token.
-After pip install, use `k` directly; do not edit it. Source checkouts also
-include `k.py.template` for storing a token in an ignored local `k.py` file.
+TCP mode uses `127.0.0.1:K_PORT` (default 7399) and token authentication. The
+daemon writes `daemon.json` for local clients:
+
+- Windows: `%LOCALAPPDATA%\agent-tty\daemon.json`
+- POSIX TCP: `$XDG_RUNTIME_DIR/agent-tty/daemon.json`
+- POSIX TCP fallback: `/tmp/agent-tty-$UID/daemon.json`
+
+Clients use `K_TOKEN`/`K_PORT` env vars as overrides, then `daemon.json`. After
+pip install, use `k` directly; do not edit it. Use `k daemon --show-token` only
+when you deliberately need shell setup text printed to stderr. Source checkouts
+also include `k.py.template` as an optional debug wrapper.
+
+Only one auto-discoverable TCP daemon can own `daemon.json` at a time. Starting
+a second TCP daemon while the metadata file points to a live daemon fails loud
+instead of replacing the first daemon's token.
 
 On Windows, WinPTY mode requires `pywinpty`. With `pywinpty` available the daemon
 prints `mode=winpty`; otherwise it falls back to `mode=socket`.

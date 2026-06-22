@@ -2,7 +2,8 @@
 """Windows TCP smoke tests.
 
 Starts a real daemon on a loopback TCP port, reads the daemon token from
-stderr, then exercises the public CLI client path with K_TOKEN/K_PORT set.
+private daemon.json metadata, then exercises the public CLI client path.
+Clients should work without K_TOKEN because the daemon writes that metadata.
 
 Requires: Windows.  The session may use WinPTY when pywinpty is installed, or
 the socket-console fallback otherwise.
@@ -12,12 +13,13 @@ Skip on non-Windows; POSIX PTY coverage lives in test_pty_posix.py.
 import json
 import os
 import queue
-import re
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +36,18 @@ def check(name, expect, actual):
     else:
         print(f"  X {name}")
         print(f"    expect: {expect!r}")
+        first = actual.splitlines()[0] if actual.splitlines() else actual
+        print(f"    actual: {first[:160]!r}")
+        FAIL += 1
+
+
+def check_absent(name, needle, actual):
+    global PASS, FAIL
+    if needle not in actual:
+        PASS += 1
+    else:
+        print(f"  X {name}")
+        print(f"    expect absent: {needle!r}")
         first = actual.splitlines()[0] if actual.splitlines() else actual
         print(f"    actual: {first[:160]!r}")
         FAIL += 1
@@ -74,9 +88,48 @@ def run_k(env, *args):
     return p.returncode, p.stdout.strip(), p.stderr.strip()
 
 
-def wait_for_daemon(daemon, stderr_lines):
-    """Return (token, first_lines) after daemon prints TCP startup lines."""
-    token = None
+def daemon_meta_path(env):
+    base = env.get("LOCALAPPDATA") or os.environ.get("LOCALAPPDATA")
+    return Path(base) / "agent-tty" / "daemon.json"
+
+
+def check_attach_reads_daemon_meta(env, expected_token):
+    """Unit-check attach() token selection without entering interactive mode."""
+    global PASS, FAIL
+    spec = importlib.util.spec_from_file_location("agent_tty_under_test",
+                                                  AGENT_TTY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    captured = {}
+    old_localappdata = os.environ.get("LOCALAPPDATA")
+    old_token = os.environ.pop("K_TOKEN", None)
+    os.environ["LOCALAPPDATA"] = env["LOCALAPPDATA"]
+    try:
+        mod._send = lambda cmd, args: "12345"
+        mod._HAS_PTY = True
+        mod._attach_pty_win = (
+            lambda port, token, name: captured.update(
+                {"port": port, "token": token, "name": name}))
+        mod.attach("test1")
+        if captured.get("token") == expected_token:
+            PASS += 1
+        else:
+            print("  X attach-reads-daemon-meta-token")
+            print(f"    expect: {expected_token!r}")
+            print(f"    actual: {captured.get('token')!r}")
+            FAIL += 1
+    finally:
+        if old_localappdata is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = old_localappdata
+        if old_token is not None:
+            os.environ["K_TOKEN"] = old_token
+
+
+def wait_for_daemon(daemon, stderr_lines, meta_path):
+    """Return first stderr lines after daemon writes TCP metadata."""
     lines = []
     deadline = time.time() + 10
     while time.time() < deadline:
@@ -85,15 +138,40 @@ def wait_for_daemon(daemon, stderr_lines):
         try:
             line = stderr_lines.get(timeout=0.1)
         except queue.Empty:
+            if meta_path.exists():
+                return lines
             continue
         line = line.rstrip("\n")
         lines.append(line)
-        m = re.search(r"token=([0-9a-f]+)", line)
-        if m:
-            token = m.group(1)
-        if token and any("set K_TOKEN=" in x for x in lines):
-            return token, lines
-    return token, lines
+        if meta_path.exists():
+            return lines
+    return lines
+
+
+def check_second_daemon_rejected(env):
+    second_env = env.copy()
+    second_env["K_PORT"] = str(free_tcp_port())
+    try:
+        p = subprocess.run(
+            [sys.executable, "-B", str(AGENT_TTY), "daemon"],
+            env=second_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+    except subprocess.TimeoutExpired as e:
+        global FAIL
+        FAIL += 1
+        print("  X second-daemon-rejected")
+        print("    expect: fast failure")
+        print(f"    actual: timeout stdout={e.stdout!r} stderr={e.stderr!r}")
+        return
+    check("second-daemon-rejected",
+          "daemon metadata already points to live daemon",
+          p.stdout + p.stderr)
+    check("second-daemon-exit-nonzero", "1", str(p.returncode))
 
 
 def main():
@@ -104,7 +182,11 @@ def main():
     port = free_tcp_port()
     env = os.environ.copy()
     env["K_PORT"] = str(port)
+    env["LOCALAPPDATA"] = str(ROOT / ".tmp-agent-tty-test-localappdata")
     env.pop("K_TOKEN", None)
+    meta_path = daemon_meta_path(env)
+    if meta_path.exists():
+        meta_path.unlink()
 
     daemon = subprocess.Popen(
         [sys.executable, "-B", str(AGENT_TTY), "daemon"],
@@ -112,6 +194,7 @@ def main():
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
     stderr_lines = queue.Queue()
 
@@ -122,20 +205,37 @@ def main():
     threading.Thread(target=read_stderr, daemon=True).start()
 
     try:
-        token, startup_lines = wait_for_daemon(daemon, stderr_lines)
-        if not token:
+        startup_lines = wait_for_daemon(daemon, stderr_lines, meta_path)
+        if not meta_path.exists():
             print("  X daemon-token")
-            print("    expect: token=... on stderr")
+            print("    expect: daemon.json metadata")
             print(f"    stderr: {startup_lines!r}")
             return 1
 
         print("=== Windows TCP regression tests ===")
 
-        check("daemon-prints-set-token", "set K_TOKEN=", "\n".join(startup_lines))
+        joined_startup = "\n".join(startup_lines)
+        check_absent("daemon-hides-token-line", "token=", joined_startup)
+        check_absent("daemon-hides-set-token", "K_TOKEN=", joined_startup)
+        check("daemon-writes-meta", "daemon.json", str(meta_path))
+        check("daemon-meta-exists", "True", str(meta_path.exists()))
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        token = meta.get("token", "")
+        if token:
+            global PASS, FAIL
+            PASS += 1
+        else:
+            print("  X daemon-meta-token-present")
+            print("    expect: non-empty token")
+            print(f"    actual: {meta!r}")
+            FAIL += 1
+        check("daemon-meta-port", str(port), str(meta.get("port")))
+        check_second_daemon_rejected(env)
+        check_attach_reads_daemon_meta(env, token)
 
-        # No token should not be accepted.
+        # No K_TOKEN env should still work via daemon.json.
         _, out, err = run_k(env, "ls")
-        check("auth-required", "ERR auth failed", out + err)
+        check("token-file-auth", "(no sessions)", out + err)
 
         client_env = env.copy()
         client_env["K_TOKEN"] = token
@@ -238,12 +338,21 @@ def main():
         check("run-dead-session", "ERR", out + err)
 
     finally:
-        daemon.terminate()
+        if daemon.poll() is None:
+            daemon.send_signal(signal.CTRL_BREAK_EVENT)
         try:
             daemon.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            daemon.kill()
-            daemon.wait(timeout=2)
+            daemon.terminate()
+            try:
+                daemon.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+                daemon.wait(timeout=2)
+        deadline = time.time() + 5
+        while time.time() < deadline and meta_path.exists():
+            time.sleep(0.1)
+        check("daemon-removes-meta", "False", str(meta_path.exists()))
 
     print()
     print(f"=== {PASS} passed, {FAIL} failed ===")

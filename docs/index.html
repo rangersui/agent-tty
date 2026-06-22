@@ -379,7 +379,7 @@ threading.Thread(target=on_done, daemon=True).start()
 <!-- ═══ COMMAND MAP ═══ -->
 <section>
   <h2 class="center">Commands</h2>
-  <div class="flow"><span class="hl">k daemon</span>                  start daemon in foreground
+  <div class="flow"><span class="hl">k daemon</span> [--show-token]   start daemon in foreground
 <span class="hl">k new</span> &lt;name&gt;              create a Python session
 <span class="hl">k int</span> &lt;name&gt;              interrupt running async cells
 <span class="hl">k kill</span> &lt;name&gt;             terminate session
@@ -393,7 +393,12 @@ threading.Thread(target=on_done, daemon=True).start()
 <span class="hl">k attach</span> &lt;name&gt;           human REPL (Ctrl-] to detach)
 <span class="hl">k --version|-V|version</span>    print version
 
-TCP mode requires <span class="hl">K_TOKEN</span>. Windows: <span class="hl">set K_TOKEN=...</span>. Linux/macOS TCP: <span class="hl">export K_TOKEN=...</span>. <span class="hl">K_PORT</span> defaults to 7399 unless changed. See <a href="https://github.com/rangersui/agent-tty/blob/main/README.md">README</a>.</div>
+TCP mode writes <span class="hl">daemon.json</span> for local token discovery.
+Shutdown removes that metadata file.
+Tokens are printed only with <span class="hl">k daemon --show-token</span>.
+Only one auto-discoverable TCP daemon owns <span class="hl">daemon.json</span>.
+<span class="hl">K_TOKEN</span> and <span class="hl">K_PORT</span> remain overrides.
+See <a href="https://github.com/rangersui/agent-tty/blob/main/README.md">README</a>.</div>
 </section>
 
 <!-- ═══ LINKS ═══ -->

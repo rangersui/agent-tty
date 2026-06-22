@@ -45,7 +45,7 @@ k daemon
 ```
 
 Stop the daemon with `Ctrl-C` in that terminal. Daemon shutdown terminates owned
-sessions and closes the control socket.
+sessions, closes the control socket, and removes TCP `daemon.json` metadata.
 
 Use the client from another terminal:
 
@@ -157,7 +157,6 @@ with the session the human can attach to.
 Use the host shell as plumbing:
 
 - start or stop the daemon,
-- set `K_TOKEN` in TCP mode,
 - write larger Python cells to files before loading them,
 - inspect or repair the repository when no session is available.
 
@@ -170,7 +169,7 @@ k run work "import subprocess; subprocess.run(['git', 'status'])"
 ## Command Reference
 
 ```text
-k daemon                  start daemon in foreground
+k daemon [--show-token]   start daemon in foreground
 k new <name>              create a Python session
 k int <name>              interrupt running async cells
 k kill <name>             terminate session process and forget it
@@ -243,7 +242,7 @@ Each command has a fixed output style:
 | `k vars` | JSON | `{"vars":["name", ...]}` |
 | `k complete` | JSON | `{"matches":["os.path", ...]}` |
 | `k attach` | stream | interactive console |
-| `k --version` | text | `agent-tty 0.2.0`; aliases: `k -V`, `k version` |
+| `k --version` | text | `agent-tty 0.2.1`; aliases: `k -V`, `k version` |
 
 `k run` prints expression results like a Python REPL: strings print as raw text;
 other values use `repr`.
@@ -282,29 +281,46 @@ most recent cell in the session, or `{"status":"idle"}` if no cells exist.
 
 AF_UNIX mode uses `K_SOCK`, defaulting to `/tmp/k.sock`.
 
-TCP mode uses `127.0.0.1:K_PORT` (default 7399) and requires `K_TOKEN`. Native
-Windows uses TCP mode. The daemon prints the token on startup:
+TCP mode uses `127.0.0.1:K_PORT` (default 7399) and token authentication.
+Native Windows uses TCP mode. The daemon writes private daemon metadata for
+local clients:
 
 ```text
-k daemon pid=12345 127.0.0.1:7399 mode=winpty token=abc123...
-set K_TOKEN=abc123...
+k daemon pid=12345 127.0.0.1:7399 mode=winpty meta=...\daemon.json
 ```
 
-On Linux/macOS (when using TCP explicitly):
+The metadata file lets a new terminal run `k ls` without setting `K_TOKEN`.
+Shutdown removes the metadata file.
+
+| platform | metadata path |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\agent-tty\daemon.json` |
+| POSIX TCP | `$XDG_RUNTIME_DIR/agent-tty/daemon.json` |
+| POSIX TCP fallback | `/tmp/agent-tty-$UID/daemon.json` |
+
+Only one auto-discoverable TCP daemon can own `daemon.json` at a time. Starting
+a second TCP daemon while the metadata file points to a live daemon fails loud
+instead of replacing the first daemon's token.
+
+`K_TOKEN` and `K_PORT` remain explicit overrides for debugging or unusual
+shells. Use `k daemon --show-token` only when you deliberately want shell setup
+text printed to stderr:
 
 ```text
+k daemon --show-token
+set K_TOKEN=abc123...
 export K_TOKEN=abc123...
 ```
 
-Attach uses the same token in TCP mode, so the client shell running `k attach`
-or other `k` commands must have `K_TOKEN` set.
+Attach uses the same token lookup in TCP mode, so `k attach` works from another
+terminal after the daemon metadata file exists.
 
-In a source checkout, `k.py.template` is an optional convenience wrapper for
-storing a local daemon token:
+In a source checkout, `k.py.template` is an optional debug wrapper for storing a
+local daemon token:
 
 ```bash
 cp k.py.template k.py
-# paste K_TOKEN and K_PORT into k.py
+# paste K_TOKEN and K_PORT into k.py if you want a fixed-token wrapper
 python k.py ls
 python k.py new work
 ```
@@ -337,7 +353,7 @@ Windows TCP regression suite:
 python -B tests/test_tcp_windows.py
 ```
 
-The Windows suite starts a daemon on loopback TCP, reads the daemon token from
-stderr, sets `K_TOKEN`/`K_PORT`, then exercises the real CLI client path. It
-works with WinPTY when `pywinpty` is installed and with socket-console fallback
-otherwise.
+The Windows suite starts a daemon on loopback TCP, verifies daemon.json token
+discovery without startup token leakage, then exercises the real CLI client
+path. It works with WinPTY when `pywinpty` is installed and with socket-console
+fallback otherwise.

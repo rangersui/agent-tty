@@ -20,13 +20,15 @@ Human interaction:
 
 Transport:
   - AF_UNIX mode uses filesystem-local K_SOCK, default /tmp/k.sock.
-  - TCP mode uses 127.0.0.1:K_PORT and requires K_TOKEN.
+  - TCP mode uses 127.0.0.1:K_PORT and token authentication.
+  - The daemon writes daemon.json with port/token for local clients.
+  - Clients use K_TOKEN/K_PORT env vars as overrides, then daemon.json.
+  - TCP daemon startup does not print the token unless --show-token is used.
   - After pip install, the generated k command is complete; do not edit it.
-  - For TCP clients, set K_TOKEN in the client shell.  Source checkouts also
-    include k.py.template as an optional local wrapper.
+  - Source checkouts include k.py.template as an optional debug wrapper.
 
 Commands:
-    k daemon                  start daemon in foreground
+    k daemon [--show-token]   start daemon in foreground
     k new <name>              create a Python session
     k int <name>              interrupt running async cells
     k kill <name>             terminate session process and forget it
@@ -54,7 +56,7 @@ import signal, subprocess
 import multiprocessing as mp
 import secrets
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 _HAS_AF_UNIX = hasattr(socket, "AF_UNIX")
 _HAS_PTY = False
@@ -84,12 +86,113 @@ SOCK = os.environ.get("K_SOCK", _default_sock())
 # SOCKET helpers
 # -----------------------------------------------
 
+def _runtime_dir():
+    """Return the private runtime directory used for TCP daemon metadata."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+        path = os.path.join(base, "agent-tty")
+    else:
+        base = os.environ.get("XDG_RUNTIME_DIR")
+        if base:
+            path = os.path.join(base, "agent-tty")
+        else:
+            path = os.path.join(tempfile.gettempdir(),
+                                f"agent-tty-{os.getuid()}")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    if sys.platform != "win32":
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+    return path
+
+def _daemon_meta_path():
+    return os.path.join(_runtime_dir(), "daemon.json")
+
+def _tcp_daemon_alive(meta):
+    """Return True when daemon metadata points to a reachable k daemon."""
+    try:
+        port = int(meta.get("port"))
+        token = str(meta.get("token", ""))
+    except (TypeError, ValueError):
+        return False
+    if not token:
+        return False
+    s = None
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=1.0)
+        s.sendall(json.dumps({"cmd": "ls", "args": [], "token": token}).encode())
+        s.shutdown(socket.SHUT_WR)
+        data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        return False
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+    return bool(data) and data != b"ERR auth failed"
+
+def _write_daemon_meta(port, token):
+    """Persist TCP daemon connection metadata for other local client shells."""
+    path = _daemon_meta_path()
+    existing = _read_daemon_meta()
+    if existing and _tcp_daemon_alive(existing):
+        pid = existing.get("pid", "?")
+        old_port = existing.get("port", "?")
+        raise RuntimeError(
+            "daemon metadata already points to live daemon "
+            f"pid={pid} port={old_port}; stop it before starting another "
+            "auto-discoverable TCP daemon")
+    tmp = path + ".tmp"
+    data = {"port": int(port), "token": token, "pid": os.getpid()}
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        os.write(fd, json.dumps(data).encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if sys.platform != "win32":
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+def _read_daemon_meta():
+    """Read TCP daemon metadata, returning {} when absent or invalid."""
+    try:
+        with open(_daemon_meta_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+def _remove_daemon_meta():
+    meta = _read_daemon_meta()
+    if meta.get("pid") != os.getpid():
+        return
+    try:
+        os.remove(_daemon_meta_path())
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
 def _server_socket():
     """Create the daemon control socket.
 
     AF_UNIX mode is path-based and intended for POSIX local use.  TCP mode is
-    loopback-only and must be authenticated with K_TOKEN because any local
-    process can attempt to connect to the port.
+    loopback-only and must be authenticated with the daemon token because any
+    local process can attempt to connect to the port.
     """
     if _HAS_AF_UNIX:
         if os.path.exists(SOCK):
@@ -107,13 +210,14 @@ def _server_socket():
         srv.bind(("127.0.0.1", port))
     return srv
 
-def _client_socket():
+def _client_socket(meta=None):
     """Connect to the daemon control socket selected by K_SOCK or K_PORT."""
     if _HAS_AF_UNIX:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(SOCK)
     else:
-        port = int(os.environ.get("K_PORT", "7399"))
+        meta = meta or {}
+        port = int(os.environ.get("K_PORT") or meta.get("port") or "7399")
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.connect(("127.0.0.1", port))
     return s
@@ -792,32 +896,63 @@ def handle_client(cmd, args):
 
     return f"ERR unknown: {cmd}"
 
-def daemon():
+def daemon(show_token=False):
     """Run the daemon event loop until interrupted.
 
     The daemon owns session processes and control sockets.  It is intentionally
-    foreground-friendly: stderr shows token/mode information and echoes AI-run
-    cells so humans can observe what the agent is doing.
+    foreground-friendly: stderr shows pid/mode information and echoes AI-run
+    cells so humans can observe what the agent is doing.  TCP tokens are written
+    to private daemon metadata and are printed only with --show-token.
     """
     global _daemon_token
     srv = _server_socket()
     srv.listen(8)
+    srv.settimeout(0.5)
     addr = SOCK if _HAS_AF_UNIX else f"127.0.0.1:{os.environ.get('K_PORT', '7399')}"
     mode = "winpty" if _WinPty else ("pty" if _HAS_PTY else "socket")
     if not _HAS_AF_UNIX:
         _daemon_token = secrets.token_hex(16)
-        print(f"k daemon pid={os.getpid()} {addr} mode={mode} token={_daemon_token}",
+        port = int(os.environ.get("K_PORT", "7399"))
+        try:
+            _write_daemon_meta(port, _daemon_token)
+        except RuntimeError as e:
+            try:
+                srv.close()
+            except OSError:
+                pass
+            print(f"ERR {e}", file=sys.stderr)
+            raise SystemExit(1)
+        print(f"k daemon pid={os.getpid()} {addr} mode={mode} meta={_daemon_meta_path()}",
               file=sys.stderr)
-        if sys.platform == "win32":
-            print(f"set K_TOKEN={_daemon_token}", file=sys.stderr)
-        else:
-            print(f"export K_TOKEN={_daemon_token}", file=sys.stderr)
+        if show_token:
+            if sys.platform == "win32":
+                print(f"set K_TOKEN={_daemon_token}", file=sys.stderr)
+            else:
+                print(f"export K_TOKEN={_daemon_token}", file=sys.stderr)
     else:
         print(f"k daemon pid={os.getpid()} {addr} mode={mode}", file=sys.stderr)
 
+    def _stop(signum, frame):
+        raise KeyboardInterrupt
+
+    old_sigterm = None
+    old_sigbreak = None
+    try:
+        old_sigterm = signal.signal(signal.SIGTERM, _stop)
+    except (AttributeError, ValueError):
+        pass
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            old_sigbreak = signal.signal(signal.SIGBREAK, _stop)
+        except (AttributeError, ValueError):
+            pass
+
     try:
         while True:
-            conn, _ = srv.accept()
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
             data = b""
             while True:
                 chunk = conn.recv(8192)
@@ -839,11 +974,23 @@ def daemon():
     except KeyboardInterrupt:
         print("\nk stopped", file=sys.stderr)
     finally:
+        if old_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, old_sigterm)
+            except (AttributeError, ValueError):
+                pass
+        if old_sigbreak is not None and hasattr(signal, "SIGBREAK"):
+            try:
+                signal.signal(signal.SIGBREAK, old_sigbreak)
+            except (AttributeError, ValueError):
+                pass
         for name in list(sessions):
             kill_session(name)
         srv.close()
         if _HAS_AF_UNIX and os.path.exists(SOCK):
             os.unlink(SOCK)
+        if not _HAS_AF_UNIX:
+            _remove_daemon_meta()
 
 # =============================================
 # CLIENT
@@ -851,13 +998,14 @@ def daemon():
 
 def _send(cmd, args):
     """Send one command to daemon, return response string."""
+    meta = _read_daemon_meta() if not _HAS_AF_UNIX else {}
     try:
-        s = _client_socket()
+        s = _client_socket(meta)
     except (ConnectionRefusedError, FileNotFoundError, OSError):
         return None
     msg = {"cmd": cmd, "args": args}
     if not _HAS_AF_UNIX:
-        token = os.environ.get("K_TOKEN")
+        token = os.environ.get("K_TOKEN") or meta.get("token")
         if token:
             msg["token"] = token
     s.sendall(json.dumps(msg).encode())
@@ -894,7 +1042,10 @@ def attach(name):
         print(resp, file=sys.stderr)
         return
     port = int(resp)
-    token = os.environ.get("K_TOKEN", "")
+    if _HAS_AF_UNIX:
+        token = ""
+    else:
+        token = os.environ.get("K_TOKEN") or _read_daemon_meta().get("token", "")
     if _HAS_PTY:
         if sys.platform == "win32":
             _attach_pty_win(port, token, name)
@@ -1088,7 +1239,10 @@ def main():
         session_worker_pty(ai_sock)
         sys.exit(0)
     if argv[0] == "daemon":
-        daemon()
+        if len(argv) > 2 or (len(argv) == 2 and argv[1] != "--show-token"):
+            print("usage: k daemon [--show-token]", file=sys.stderr)
+            sys.exit(1)
+        daemon(show_token=(len(argv) == 2))
     elif argv[0] == "attach":
         name = argv[1] if len(argv) > 1 else "default"
         attach(name)
