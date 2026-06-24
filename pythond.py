@@ -155,7 +155,21 @@ _MAX_WS_PAYLOAD = int(os.environ.get("PYTHOND_MAX_WS_PAYLOAD", str(16 * 1024 * 1
 _MAX_WORKER_RESPONSE = int(os.environ.get("PYTHOND_MAX_WORKER_RESPONSE", str(16 * 1024 * 1024)))
 _MAX_TLS_BRIDGE_THREADS = int(os.environ.get("PYTHOND_MAX_TLS_BRIDGE_THREADS", "256"))
 _TLS_BRIDGE_IO_TIMEOUT = float(os.environ.get("PYTHOND_TLS_BRIDGE_IO_TIMEOUT", "30"))
-_SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+_SESSION_NAME_RE = re.compile(r"^[a-z0-9_-]{1,80}$")
+_WIN_RESERVED_NAME_RE = re.compile(
+    r"^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\.|$)",
+    re.IGNORECASE,
+)
+_ANSI_ESCAPE_RE = re.compile(
+    r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\))|"
+    r"(?:\x1b\[[0-?]*[ -/]*[@-~])|"
+    r"(?:\x1b[@-Z\\-_])"
+)
+_TERMINAL_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_SESSION_NAME_RULE = (
+    "Session names: lowercase a-z, 0-9, '_' or '-', 1-80 chars; "
+    "Windows device names are rejected."
+)
 _BUFFER_CHUNK = 64 * 1024
 _WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _ASYNC_CELL_TTL = 300
@@ -214,9 +228,8 @@ SOCK = os.environ.get("PYTHOND_SOCK", _default_sock())
 def _validate_session_name(name: str) -> str:
     """Validate a session/proxy name before it becomes a filesystem path."""
     if (not isinstance(name, str) or not _SESSION_NAME_RE.fullmatch(name)
-            or ".." in name
-            or name in (".", "..")
-            or name.rstrip(" .") != name):
+            or name != name.lower()
+            or _WIN_RESERVED_NAME_RE.match(name)):
         raise ValueError("invalid session name")
     return name
 
@@ -934,6 +947,7 @@ class _TlsTerminatedServer:
         tls_sock = None
         inner_sock = None
         try:
+            raw.settimeout(_TLS_BRIDGE_IO_TIMEOUT)
             tls_sock = self._ssl_ctx.wrap_socket(raw, server_side=True)
             if self._trusted_client_dir is not None:
                 _verify_peer_fingerprint(tls_sock, self._trusted_client_dir,
@@ -1036,6 +1050,10 @@ def _init_namespace() -> JsonDict:
     exec("import os,sys,json,subprocess,shutil,hashlib,time,re,glob,sqlite3,socket", ns)
     return ns
 
+def _sanitize_terminal_text(s: str) -> str:
+    """Remove terminal control sequences before writing to daemon stderr/stdout."""
+    return _TERMINAL_CONTROL_RE.sub("", _ANSI_ESCAPE_RE.sub("", s))
+
 class _ThreadStdout:
     """Thread-local stdout wrapper.  Each thread captures to its own buffer.
 
@@ -1048,10 +1066,15 @@ class _ThreadStdout:
         self._local = threading.local()
     def write(self, s: str) -> typing.Any:
         buf = getattr(self._local, "buf", None)
-        return (buf or self._real).write(s)
+        if buf is not None:
+            return buf.write(s)
+        return self._real.write(_sanitize_terminal_text(s))
     def writelines(self, lines: typing.Iterable[str]) -> None:
         buf = getattr(self._local, "buf", None)
-        (buf or self._real).writelines(lines)
+        if buf is not None:
+            buf.writelines(lines)
+            return
+        self._real.writelines(_sanitize_terminal_text(line) for line in lines)
     def flush(self) -> None:
         buf = getattr(self._local, "buf", None)
         (buf or self._real).flush()
@@ -1420,6 +1443,7 @@ def _dispatch(
             skipped: list[str] = []
             try:
                 if chunks:
+                    # Trust boundary: child runs arbitrary user code; pickle adds no new capability and is intentional
                     data = pickle.loads(b"".join(chunks))
                     output = data.get("output", "")
                     had_error = bool(data.get("_error", False))
@@ -3435,8 +3459,9 @@ def _worker_entry(argv: list[str]) -> bool:
 def _add_session_subparsers(sub: argparse._SubParsersAction) -> None:
     p_attach = sub.add_parser("attach", help="attach terminal to session")
     p_attach.add_argument("name", nargs="?", default="default")
-    p_new = sub.add_parser("new", help="create session")
-    p_new.add_argument("name")
+    p_new = sub.add_parser("new", help="create session",
+                           description=_SESSION_NAME_RULE)
+    p_new.add_argument("name", help="canonical lowercase session name")
     for cname, chelp in (
         ("run", "sync exec, raw output"),
         ("fire", "async thread exec"),
@@ -3476,7 +3501,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="pythond",
         description="Persistent Python REPL daemon.",
-        epilog="Use pysh for session commands and pyctl for daemon management.",
+        epilog=f"Use pysh for session commands and pyctl for daemon management. {_SESSION_NAME_RULE}",
     )
     parser.add_argument("-V", "--version", action="version",
                         version=f"pythond {__version__}")
@@ -3515,7 +3540,7 @@ def pysh_main() -> None:
     parser = argparse.ArgumentParser(
         prog="pysh",
         description="Python Shell: client for pythond daemon.",
-        epilog="Remote sessions are managed by pyctl connect/disconnect.",
+        epilog=f"{_SESSION_NAME_RULE} Remote sessions are managed by pyctl connect/disconnect.",
     )
     parser.add_argument("-V", "--version", action="version",
                         version=f"pythond {__version__}")

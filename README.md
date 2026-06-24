@@ -56,6 +56,10 @@ pyctl trust <cert.pem>                     let this client connect (server-side)
 pyctl pin <cert.pem>                       verify this server is real (client-side)
 ```
 
+Session names are canonical lowercase: `a-z`, `0-9`, `_`, or `-`, 1-80
+characters. Names with uppercase letters or dots are rejected. Windows device
+names such as `con`, `nul`, `prn`, `aux`, `com1`, and `lpt1` are also rejected.
+
 ## Stateful First
 
 Most command tools are intentionally stateless: fork, run, die. That is simple

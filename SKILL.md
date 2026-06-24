@@ -86,6 +86,10 @@ pysh vars <name>             # JSON namespace names
 pysh complete <name> "text"  # JSON completion candidates
 ```
 
+Session names are canonical lowercase: `a-z`, `0-9`, `_`, or `-`, 1-80
+characters. Names with uppercase letters or dots are rejected. Windows device
+names such as `con`, `nul`, `prn`, `aux`, `com1`, and `lpt1` are also rejected.
+
 ## run, fire, fork
 
 Use `run` for short operations and direct inspection.

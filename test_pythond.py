@@ -265,6 +265,25 @@ def test_thread_stdout_compat_methods():
     check("isatty forwards", wrapper.isatty() is False)
 
 
+def test_thread_stdout_sanitizes_terminal_fallback_only():
+    section("_ThreadStdout sanitizes terminal fallback only")
+    real = io.StringIO()
+    wrapper = pythond._ThreadStdout(real)
+    wrapper.write("ok\x1b[31mred\x1b[0m\x07\r\n")
+    wrapper.writelines(["x\x1b]52;c;bad\x07y", "\x1b[2Jz"])
+    check("terminal fallback strips escapes",
+          real.getvalue() == "okred\nxyz", repr(real.getvalue()))
+
+    buf = io.StringIO()
+    wrapper._local.buf = buf
+    try:
+        wrapper.write("raw\x1b[31m kept")
+    finally:
+        wrapper._local.buf = None
+    check("cell capture keeps raw output", buf.getvalue() == "raw\x1b[31m kept",
+          repr(buf.getvalue()))
+
+
 def test_dispatch_run():
     section("_dispatch run")
     ns = pythond._init_namespace()
@@ -637,9 +656,14 @@ def test_cell_eviction():
 
 def test_session_name_sanitization():
     section("session name sanitization")
+    good_names = ["work", "work-1", "work_1", "a0"]
+    for name in good_names:
+        check(f"accept '{name}'", pythond._validate_session_name(name) == name)
     bad_names = [
         "../etc", "foo/bar", "a\\b", "x\0y", "", ".", "..",
-        ".../.../passwd", "work.", "work ",
+        ".../.../passwd", "work.", "work ", "Work", "WORK", "work.name",
+        "con", "CON", "nul", "prn", "aux", "com0", "com1", "lpt1", "lpt9",
+        "con.txt",
     ]
     for name in bad_names:
         resp = pythond.handle_client("new", [name])
@@ -1371,6 +1395,39 @@ def test_tls_bridge_recv_want_read_waits_instead_of_spinning():
     check("bridge waited after WantRead", sel.call_count == 2, sel.call_count)
 
 
+def test_tls_bridge_handshake_has_timeout():
+    section("TLS bridge handshake has timeout")
+
+    class FakeRaw:
+        def __init__(self):
+            self.timeout = None
+            self.closed = False
+        def settimeout(self, value):
+            self.timeout = value
+        def close(self):
+            self.closed = True
+
+    class FakeSslCtx:
+        def wrap_socket(self, raw, server_side=False):
+            raise TimeoutError("slow handshake")
+
+    raw = FakeRaw()
+    server = object.__new__(pythond._TlsTerminatedServer)
+    server._ssl_ctx = FakeSslCtx()
+    server._trusted_client_dir = None
+    server._inner_port = 1
+    server._stopped = threading.Event()
+    old_timeout = pythond._TLS_BRIDGE_IO_TIMEOUT
+    pythond._TLS_BRIDGE_IO_TIMEOUT = 0.25
+    try:
+        server._handle(raw)
+    finally:
+        pythond._TLS_BRIDGE_IO_TIMEOUT = old_timeout
+    check("raw socket timeout set before TLS handshake", raw.timeout == 0.25,
+          raw.timeout)
+    check("raw socket closed after failed handshake", raw.closed is True)
+
+
 def test_tls_and_auth_hardening_static():
     section("TLS/auth hardening")
     src = (ROOT / "pythond.py").read_text(encoding="utf-8")
@@ -1459,7 +1516,15 @@ def test_connection_hardening_static():
     main_seg = src[src.index("def main("):src.index("def pysh_main(")]
     pysh_seg = src[src.index("def pysh_main("):src.index("def pyctl_main(")]
     worker_entry_seg = src[src.index("def _worker_entry("):src.index("def _add_session_subparsers(")]
+    session_name_seg = src[src.index("_SESSION_NAME_RE ="):src.index("_BUFFER_CHUNK")]
+    validate_name_seg = src[src.index("def _validate_session_name("):src.index("def _public_error(")]
 
+    check("session names are lowercase canonical",
+          're.compile(r"^[a-z0-9_-]{1,80}$")' in session_name_seg and
+          "name != name.lower()" in validate_name_seg)
+    check("session names reject Windows reserved devices",
+          "_WIN_RESERVED_NAME_RE" in session_name_seg and
+          "_WIN_RESERVED_NAME_RE.match(name)" in validate_name_seg)
     check("blocking send waits write-ready",
           "except (_ssl.SSLWantWriteError, BlockingIOError):\n"
           "                    _, writable, _ = select.select([], [sock], []" in src)
@@ -2903,6 +2968,7 @@ def main():
         test_make_exec_thread_isolation,
         test_make_exec_restores_replaced_stdio,
         test_thread_stdout_compat_methods,
+        test_thread_stdout_sanitizes_terminal_fallback_only,
         test_dispatch_run,
         test_dispatch_fire_poll,
         test_dispatch_async_empty_code_rejected,
@@ -2954,6 +3020,7 @@ def main():
         test_tls_bridge_send_all_times_out_on_want_read,
         test_tls_bridge_send_all_times_out_on_want_write,
         test_tls_bridge_recv_want_read_waits_instead_of_spinning,
+        test_tls_bridge_handshake_has_timeout,
         test_tls_and_auth_hardening_static,
         test_connection_hardening_static,
         test_has_crypto_flag,
