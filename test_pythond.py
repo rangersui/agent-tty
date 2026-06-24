@@ -292,6 +292,42 @@ def test_dispatch_fire_poll():
     check("fire cell carries tid key", "tid" in cells[cid])
 
 
+def test_dispatch_async_empty_code_rejected():
+    section("_dispatch async empty code rejected")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    resp = pythond._dispatch("fire", ["   "], _exec, cells, ns)
+    check("fire empty rejected", resp == {"error": "fire requires code"}, resp)
+    resp = pythond._dispatch("fork", ["   "], _exec, cells, ns, lock)
+    if sys.platform == "win32":
+        check("fork windows still reports unsupported",
+              resp == {"error": "fork not supported on Windows (no COW fork)"}, resp)
+    else:
+        check("fork empty rejected", resp == {"error": "fork requires code"}, resp)
+
+
+def test_dispatch_fire_traceback_format_failure():
+    section("_dispatch fire traceback fallback")
+    ns = pythond._init_namespace()
+    cells = {}
+    def boom(src):
+        raise RuntimeError("boom")
+    with mock.patch.object(pythond.traceback, "format_exc",
+                           side_effect=RuntimeError("format failed")):
+        resp = pythond._dispatch("fire", ["x"], boom, cells, ns)
+        cid = resp["cell_id"]
+        for _ in range(20):
+            time.sleep(0.05)
+            polled = pythond._dispatch("poll", [cid], boom, cells, ns)
+            if polled["status"] == "done":
+                break
+    check("fire completed after format failure", polled["status"] == "done", polled)
+    check("fallback output", polled["output"] == "(traceback formatting failed)",
+          polled)
+
+
 def test_dispatch_poll_empty():
     section("_dispatch poll empty")
     ns = pythond._init_namespace()
@@ -567,6 +603,35 @@ def test_session_name_sanitization():
         check(f"connect rejects '{name[:20]}'", "invalid session name" in resp, resp)
 
 
+def test_control_handler_exact_arity():
+    section("control handler exact arity")
+    check("disconnect rejects extra",
+          pythond._handle_disconnect(["x", "extra"]).startswith("ERR usage"))
+    check("int rejects extra",
+          pythond._handle_int(["x", "extra"]).startswith("ERR usage"))
+    check("kill rejects extra",
+          pythond._handle_kill(["x", "extra"]).startswith("ERR usage"))
+    check("resize rejects extra",
+          pythond._handle_resize(["x", "24", "80", "extra"]).startswith("ERR usage"))
+    check("connect rejects unknown option",
+          pythond._handle_connect(["x", "127.0.0.1:1", "tok", "--bad"]).startswith(
+              "ERR usage"))
+
+
+def test_resize_dead_pty_not_ok():
+    section("resize dead PTY not OK")
+    name = "__dead_resize__"
+    with pythond._sessions_lock:
+        pythond.sessions[name] = {"type": "pty"}
+    try:
+        resp = pythond._handle_resize([name, "24", "80"])
+        check("dead PTY resize errors", resp.startswith("ERR session has no live PTY"),
+              resp)
+    finally:
+        with pythond._sessions_lock:
+            pythond.sessions.pop(name, None)
+
+
 def test_session_dir():
     section("_session_dir")
     name = "__test_session_dir__"
@@ -667,6 +732,36 @@ def test_daemon_meta_read_missing():
                            return_value="/nonexistent/daemon.json"):
         meta = pythond._read_daemon_meta()
         check("missing returns empty", meta == {})
+
+
+def test_daemon_meta_read_rejects_symlink():
+    section("daemon meta read rejects symlink")
+    if sys.platform == "win32" or not hasattr(os, "symlink") or not hasattr(os, "O_NOFOLLOW"):
+        check("skip symlink nofollow test", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        target = os.path.join(td, "target.json")
+        link = os.path.join(td, "daemon.json")
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump({"port": 9999, "token": "bad"}, f)
+        os.symlink(target, link)
+        with mock.patch.object(pythond, "_daemon_meta_path", return_value=link):
+            check("symlink returns empty", pythond._read_daemon_meta() == {})
+
+
+def test_daemon_meta_tmp_cleanup_on_write_failure():
+    section("daemon meta tmp cleanup on write failure")
+    with tempfile.TemporaryDirectory() as td:
+        fake_path = os.path.join(td, "daemon.json")
+        with mock.patch.object(pythond, "_daemon_meta_path", return_value=fake_path), \
+             mock.patch.object(pythond, "_tcp_daemon_alive", return_value=False), \
+             mock.patch.object(pythond.os, "write", side_effect=OSError("disk full")):
+            try:
+                pythond._write_daemon_meta(9999, "token")
+                check("write should fail", False)
+            except OSError:
+                check("write failed", True)
+            check("tmp removed", not os.path.exists(fake_path + ".tmp"))
 
 
 def test_cert_fingerprint_missing():
@@ -788,12 +883,61 @@ def test_send_remote_transparent_alias():
     check("transparent alias uses proxy name as remote session",
           sent[-1] == "run work\nx + 1", sent[-1])
     check("transparent alias response", resp == {"output": "42"}, repr(resp))
-
     sent.clear()
     resp = pythond._send_remote(session, {"cmd": "run", "args": ["gpu", "x + 1"]})
     check("explicit proxy keeps target remote session",
           sent[-1] == "run gpu\nx + 1", sent[-1])
     check("explicit proxy response", resp == {"output": "42"}, repr(resp))
+
+
+def test_send_remote_close_retries_and_closes():
+    section("remote close retries and closes")
+    opened = []
+
+    class FakeClose:
+        closed = False
+        def send(self, msg):
+            pass
+        def recv(self, timeout=None):
+            return pythond._WS_CLOSE
+        def close(self):
+            self.closed = True
+
+    class FakeOk:
+        def send(self, msg):
+            pass
+        def recv(self, timeout=None):
+            return '{"state":"idle"}'
+
+    first = FakeClose()
+    second = FakeOk()
+    def fake_open(*args, **kwargs):
+        ws = [first, second][len(opened)]
+        opened.append(ws)
+        return ws
+
+    session = {"type": "remote", "host": "h", "port": 1, "token": "t"}
+    with mock.patch.object(pythond, "_open_remote_ws", side_effect=fake_open):
+        resp = pythond._send_remote(session, {"cmd": "status", "args": ["work"]})
+    check("closed stale remote ws", first.closed is True)
+    check("retried after close", opened == [first, second])
+    check("remote retry response", resp == {"state": "idle"}, resp)
+
+
+def test_connect_remote_bytes_auth_failure():
+    section("connect remote bytes auth failure")
+
+    class FakeWs:
+        def send(self, msg):
+            pass
+        def recv(self, timeout=None):
+            return b"ERR auth failed"
+        def close(self):
+            pass
+
+    with mock.patch.object(pythond, "_open_remote_ws", return_value=FakeWs()):
+        resp = pythond.connect_remote("r", "127.0.0.1", 7399, "bad")
+    check("bytes auth failure recognised", resp == "ERR auth failed on remote", resp)
 
 
 def test_session_command_arg_normalization():
@@ -2257,6 +2401,8 @@ def main():
         test_thread_stdout_compat_methods,
         test_dispatch_run,
         test_dispatch_fire_poll,
+        test_dispatch_async_empty_code_rejected,
+        test_dispatch_fire_traceback_format_failure,
         test_dispatch_poll_empty,
         test_dispatch_poll_unknown,
         test_dispatch_poll_latest,
@@ -2271,12 +2417,16 @@ def main():
         test_dispatch_fork_concurrent_fire,
         test_cell_eviction,
         test_session_name_sanitization,
+        test_control_handler_exact_arity,
+        test_resize_dead_pty_not_ok,
         test_session_dir,
         test_session_capacity_limit,
         test_log_history,
         test_log_session,
         test_daemon_meta_roundtrip,
         test_daemon_meta_read_missing,
+        test_daemon_meta_read_rejects_symlink,
+        test_daemon_meta_tmp_cleanup_on_write_failure,
         test_cert_fingerprint_missing,
         test_cert_generation,
         test_trust_cert_exact_fingerprint_store,
@@ -2284,6 +2434,8 @@ def main():
         test_websocket_protocol,
         test_wire_message_builder,
         test_send_remote_transparent_alias,
+        test_send_remote_close_retries_and_closes,
+        test_connect_remote_bytes_auth_failure,
         test_session_command_arg_normalization,
         test_wspro_client_basic,
         test_wspro_client_preserves_batched_frames,

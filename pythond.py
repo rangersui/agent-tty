@@ -503,22 +503,35 @@ def _write_daemon_meta(port: int, token: str) -> None:
         flags |= os.O_NOFOLLOW
     # On Unix, set file mode 0o600.  On Windows, skip -- parent dir DACL
     # (set by _secure_path_win32) protects the file via inheritance.
-    fd = os.open(tmp, flags, 0o600) if sys.platform != "win32" else os.open(tmp, flags)
     try:
-        os.write(fd, json.dumps(data).encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    if sys.platform != "win32":
-        os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+        fd = os.open(tmp, flags, 0o600) if sys.platform != "win32" else os.open(tmp, flags)
+        try:
+            os.write(fd, json.dumps(data).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if sys.platform != "win32":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError as e:
+                print(f"WARN: cannot remove temp daemon metadata {tmp}: {e}",
+                      file=sys.stderr)
+        raise
 
 def _read_daemon_meta() -> JsonDict:
     """Read daemon metadata, returning {} when absent or invalid."""
     try:
-        with open(_daemon_meta_path(), encoding="utf-8") as f:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(_daemon_meta_path(), flags)
+        with os.fdopen(fd, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     if not isinstance(data, dict):
         return {}
@@ -918,7 +931,12 @@ class _TlsTerminatedServer:
             print(f"WARN: TLS connection failed: {e.__class__.__name__}",
                   file=sys.stderr)
         finally:
-            for sock in (tls_sock, inner_sock, raw):
+            sockets: tuple[SocketLike | None, ...] = (
+                tls_sock,
+                inner_sock,
+                None if tls_sock is not None else raw,
+            )
+            for sock in sockets:
                 if sock is None:
                     continue
                 try:
@@ -1105,7 +1123,7 @@ def _make_exec(
                 stderr._local.buf = None
                 sys.stdout = stdout_wrapper
                 sys.stderr = stderr_wrapper
-            output = buf.getvalue().rstrip()
+            output = buf.getvalue().rstrip("\n")
             result = _ExecOutput(output, had_error)
         if on_done:
             try:
@@ -1175,16 +1193,23 @@ def _dispatch(
         # Process would fork a copy -- writes to the copy don't propagate back.
         # Tradeoff: threads can't be force-killed when stuck in C code
         # (requests.get, time.sleep).  pysh kill (whole session) is the escape.
+        if not args or not str(args[0]).strip():
+            return {"error": "fire requires code"}
         cid = uuid.uuid4().hex[:12]
         res = {"output": "", "status": "running", "tid": None,
                "_seq": next(_CELL_SEQ)}
         def _bg(c: str = args[0], r: JsonDict = res) -> None:
+            output = "(fire result failed)"
+            error = True
             try:
                 out = _exec(c)
                 output = str(out)
                 error = bool(getattr(out, "error", False))
             except BaseException:
-                output = traceback.format_exc().rstrip()
+                try:
+                    output = traceback.format_exc().rstrip()
+                except Exception:
+                    output = "(traceback formatting failed)"
                 error = True
             finally:
                 with _cells_lock:
@@ -1222,6 +1247,8 @@ def _dispatch(
         # CUDA, sqlite, logging handlers).  pysh kill to escape.
         if sys.platform == "win32":
             return {"error": "fork not supported on Windows (no COW fork)"}
+        if not args or not str(args[0]).strip():
+            return {"error": "fork requires code"}
         cid = uuid.uuid4().hex[:12]
         # Use os.fork() + os._exit() instead of mp.Process.
         # mp.Process does Python cleanup after fork (join threads, atexit,
@@ -1525,6 +1552,13 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
                                      _exec, cells, ns, lock)
                     wf.write(json.dumps(resp) + "\n")
                     wf.flush()
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    try:
+                        wf.write(json.dumps({"error": "worker protocol error"}) + "\n")
+                        wf.flush()
+                    except BaseException:
+                        pass
+                    break
                 except Exception:
                     try:
                         wf.write(json.dumps({"error": "worker protocol error"}) + "\n")
@@ -1756,6 +1790,7 @@ def new_session(name: str) -> None:
     if _HAS_PTY and _WinPty is not None:
         ai_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         proc = None
+        ai_conn: socket.socket | None = None
         try:
             if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
                 ai_srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
@@ -1789,6 +1824,7 @@ def new_session(name: str) -> None:
         finally:
             ai_srv.close()
         assert proc is not None
+        assert ai_conn is not None
         def _read() -> bytes:
             try:
                 return proc.read().encode()
@@ -1796,9 +1832,16 @@ def new_session(name: str) -> None:
                 return b""
         def _write(data: bytes) -> None:
             proc.write(data.decode(errors="replace"))
+        try:
+            bridge = PtyBridge(_read, _write)
+        except Exception:
+            ai_conn.close()
+            with contextlib.suppress(Exception):
+                proc.terminate(force=True)
+            raise
         session = {
             "type": "pty", "winpty": proc,
-            "ai": ai_conn, "bridge": PtyBridge(_read, _write),
+            "ai": ai_conn, "bridge": bridge,
         }
         try:
             _set_session(name, session)
@@ -2376,6 +2419,12 @@ def _send_remote(
             return {"error": "remote response failed"}
         if resp is _WS_CLOSE:
             session["_ws"] = None
+            try:
+                ws.close()
+            except Exception:
+                pass  # stale connection -- clear it
+            if attempt == 0:
+                continue
             return {"error": "remote closed"}
         if isinstance(resp, str) and resp.startswith("ERR "):
             return {"error": resp[4:]}
@@ -2408,6 +2457,8 @@ def connect_remote(
         ws = _open_remote_ws(host, port, token, use_tls=use_tls, timeout=10)
         ws.send("ls")
         resp = ws.recv(timeout=5)
+        if isinstance(resp, bytes):
+            resp = resp.decode("utf-8", "replace")
         if resp is _WS_CLOSE:
             return "ERR remote closed during probe"
         if resp == "ERR auth failed":
@@ -2442,10 +2493,10 @@ def _handle_stop(args: list[str]) -> str:
 
 
 def _handle_connect(args: list[str]) -> str:
-    if len(args) < 3:
+    if len(args) not in (3, 4) or (len(args) == 4 and args[3] != "--tls"):
         return "ERR usage: pyctl connect <name> <host:port> <token> [--tls]"
     name, addr, token = args[0], args[1], args[2]
-    use_tls = "--tls" in args
+    use_tls = len(args) == 4
     try:
         host, port = _parse_host_port(addr)
     except ValueError:
@@ -2454,7 +2505,7 @@ def _handle_connect(args: list[str]) -> str:
 
 
 def _handle_disconnect(args: list[str]) -> str:
-    if not args:
+    if len(args) != 1:
         return "ERR usage: pyctl disconnect <name>"
     name = args[0]
     s = _get_session(name)
@@ -2495,7 +2546,7 @@ def _handle_new(args: list[str]) -> str:
 
 
 def _handle_int(args: list[str]) -> str:
-    if not args:
+    if len(args) != 1:
         return "ERR usage: pysh int <name>"
     name = args[0]
     if _get_session(name) is None:
@@ -2519,7 +2570,7 @@ def _handle_int(args: list[str]) -> str:
 
 
 def _handle_kill(args: list[str]) -> str:
-    if not args:
+    if len(args) != 1:
         return "ERR usage: pysh kill <name>"
     name = args[0]
     if kill_session(name):
@@ -2528,7 +2579,7 @@ def _handle_kill(args: list[str]) -> str:
 
 
 def _handle_resize(args: list[str]) -> str:
-    if len(args) < 3:
+    if len(args) != 3:
         return "ERR usage: resize <name> <rows> <cols>"
     try:
         name, rows, cols = args[0], int(args[1]), int(args[2])
@@ -2553,6 +2604,8 @@ def _handle_resize(args: list[str]) -> str:
                 termios.TIOCSWINSZ,  # type: ignore[name-defined]
                 struct.pack("HHHH", rows, cols, 0, 0),
             )
+        else:
+            return "ERR session has no live PTY"
     return "OK"
 
 
