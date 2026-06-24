@@ -363,7 +363,7 @@ def _log_history(name: str, src: str) -> None:
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags, 0o600 if sys.platform != "win32" else 0o666)
+        fd = os.open(path, flags, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(f"\n# [{time.strftime('%Y-%m-%d %H:%M:%S')}]\n{src}\n")
     except OSError as e:
@@ -376,7 +376,7 @@ def _log_session(name: str, src: str, output: str = "", error: bool = False) -> 
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags, 0o600 if sys.platform != "win32" else 0o666)
+        fd = os.open(path, flags, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             tag = "ERROR" if error else "OK"
             f.write(f"\n# [{time.strftime('%Y-%m-%d %H:%M:%S')}] {tag}\n")
@@ -663,7 +663,7 @@ def _generate_cert() -> tuple[str, str]:
         ]:
             fd = os.open(fpath,
                          os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                         mode if sys.platform != "win32" else 0o666)
+                         mode)
             try:
                 os.write(fd, data)
                 os.fsync(fd)
@@ -825,8 +825,7 @@ def trust_cert(cert_path: str, direction: str = "client") -> tuple[str, str]:
     fp_dest = os.path.join(td, name + ".fingerprint")
     import shutil
     shutil.copy2(cert_path, dest)
-    fd = os.open(fp_dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                 0o600 if sys.platform != "win32" else 0o666)
+    fd = os.open(fp_dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.write(fd, (fp + "\n").encode("ascii"))
         os.fsync(fd)
@@ -1879,6 +1878,7 @@ def new_session(name: str) -> None:
                 close_fds=True,
                 pass_fds=(slave_fd, ai_child.fileno()),
                 env={**os.environ, _WORKER_ENV: "1"},
+                start_new_session=True,
             )
         except Exception:
             for fd in (master_fd, slave_fd):
@@ -1987,7 +1987,8 @@ def _close_session_resources(s: JsonDict) -> bool:
             s["winpty"] = None
         else:
             # Kill entire process group (worker + any fork children).
-            # Worker called os.setsid(), so its pgid == its pid.
+            # Popen created the worker in a new session, so its pgid == pid
+            # before user code can run.
             proc = s.get("proc")
             try:
                 pgid = (
@@ -3313,7 +3314,11 @@ def _worker_entry(argv: list[str]) -> bool:
     if argv[0] == "_worker_pty":
         slave_fd = int(argv[1])
         ai_fd = int(argv[2])
-        os.setsid()  # type: ignore[attr-defined]
+        try:
+            if os.getsid(0) != os.getpid():  # type: ignore[attr-defined]
+                os.setsid()  # type: ignore[attr-defined]
+        except OSError as e:
+            print(f"warn: setsid: {e}", file=sys.stderr)
         try:
             TIOCSCTTY = getattr(termios, 'TIOCSCTTY', 0x540E)  # type: ignore[name-defined]
             fcntl.ioctl(slave_fd, TIOCSCTTY, 0)  # type: ignore[name-defined]

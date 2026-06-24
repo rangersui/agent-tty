@@ -1167,6 +1167,7 @@ def test_connection_hardening_static():
     pyctl_seg = src[src.index("def pyctl_main("):src.index("if __name__ == \"__main__\":")]
     main_seg = src[src.index("def main("):src.index("def pysh_main(")]
     pysh_seg = src[src.index("def pysh_main("):src.index("def pyctl_main(")]
+    worker_entry_seg = src[src.index("def _worker_entry("):src.index("def _add_session_subparsers(")]
 
     check("blocking send waits write-ready",
           "except (_ssl.SSLWantWriteError, BlockingIOError):\n"
@@ -1270,6 +1271,10 @@ def test_connection_hardening_static():
     check("cert writes are atomic",
           "os.replace(tmp_key, key_path)" in cert_gen_seg and
           "os.replace(tmp_cert, cert_path)" in cert_gen_seg)
+    check("windows TLS files do not request world-writable mode",
+          "0o666" not in cert_gen_seg and "0o666" not in trust_cert_seg and
+          "os.open(fp_dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)" in trust_cert_seg)
+    check("no world-writable creation mode", "0o666" not in src)
     check("cert cache validates key pair",
           "_cert_key_pair_valid(cert_path, key_path)" in cert_gen_seg and
           "TLS cert/key mismatch; regenerating" in cert_gen_seg)
@@ -1298,6 +1303,9 @@ def test_connection_hardening_static():
           "self._inner_thread" in tls_server_seg)
     check("new_session rolls back failed registration",
           "_close_session_resources(session)" in new_session_seg)
+    check("posix worker starts in own session before worker code",
+          "start_new_session=True" in new_session_seg and
+          "os.getsid(0) != os.getpid()" in worker_entry_seg)
     check("set_session closes replaced session",
           "old_session = sessions.get(name)" in set_session_seg and
           "_close_session_resources(old_session)" in set_session_seg)
