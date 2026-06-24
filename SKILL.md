@@ -183,6 +183,21 @@ pyctl disconnect server
 
 The remote target syntax is `pysh <command> <server> <session> "code"`.
 
+## Security Model
+
+Treat pythond like SSH into a Python runtime.
+
+- Not a sandbox: code runs with the daemon user's OS permissions.
+- Once authenticated, a client has full access to all sessions; there is no
+  per-session permission isolation.
+- Local POSIX uses an AF_UNIX socket with file permissions.
+- Local Windows uses localhost TCP, token auth, and owner-level directory ACLs.
+- Remote access uses TLS plus token auth; mTLS adds client cert trust and server
+  pinning, but the token is still required.
+- Daemon access logs are written to runtime `access.log` and mirrored to stderr.
+  They include `conn_id`, peer, command, session, status, and `body_bytes`; they
+  do not include token values or Python code bodies.
+
 ### TLS cert management
 
 ```bash

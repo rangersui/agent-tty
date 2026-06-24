@@ -182,14 +182,31 @@ ws.send("ls")                          # "  work: alive"
 
 <h2>Security</h2>
 
+<p>The security model mirrors SSH:</p>
+
+<table>
+<tr><th>pythond</th><th>SSH equivalent</th></tr>
+<tr><td>token in <code>daemon.json</code></td><td>private key in <code>~/.ssh/</code></td></tr>
+<tr><td><code>pyctl trust cert.pem</code></td><td>adding a line to <code>authorized_keys</code></td></tr>
+<tr><td><code>pyctl pin cert.pem</code></td><td>adding a line to <code>known_hosts</code></td></tr>
+<tr><td>authenticated client</td><td>logged-in user</td></tr>
+</table>
+
+<p>Once authenticated, a client has full access to all sessions &mdash; no per-session permission isolation. Same as SSH: once you log in, you are that user with all their permissions.</p>
+
 <p>Not a sandbox: code runs with the daemon user's OS permissions.</p>
 
 <table>
 <tr><th>Mode</th><th>Auth</th></tr>
 <tr><td>Local POSIX</td><td>AF_UNIX socket, mode 0o600</td></tr>
-<tr><td>Local Windows</td><td>TCP + token, OWNER RIGHTS DACL</td></tr>
+<tr><td>Local Windows</td><td>TCP + token, OWNER RIGHTS DACL (owner-level isolation, comparable to Unix chmod 700)</td></tr>
 <tr><td>Remote</td><td>TLS + token; optional mTLS client cert and server pinning</td></tr>
 </table>
+
+<p>Access logs are written as <code>ACCESS</code> lines to runtime <code>access.log</code>
+and mirrored to stderr for supervisors. They include <code>conn_id</code>, peer,
+command, session, status, and <code>body_bytes</code>; they do not include tokens
+or Python code bodies.</p>
 
 <h2>Platform</h2>
 

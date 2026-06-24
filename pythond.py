@@ -62,19 +62,23 @@ Transport:
   Local Windows: ws://127.0.0.1:PORT -- token auth via daemon.json.
   Remote:        wss://HOST:PORT -- token auth, optional mTLS (mutual TLS).
 
-Security:
+Security (same model as SSH):
   Not a sandbox: code runs with the daemon user's OS permissions.
+  Once authenticated, full access to all sessions -- no per-session isolation.
   Local POSIX:   AF_UNIX socket mode 0o600.
-  Local Windows: OWNER RIGHTS DACL via icacls (process-tree isolation).
+  Local Windows: OWNER RIGHTS DACL via icacls (owner-level isolation, comparable to Unix chmod 700).
   Remote token:  wss:// + shared token (symmetric, password-like).
   Remote mTLS:   wss:// + mutual cert verification, plus token.
     pyctl trust  = authorized_keys (server lets client in).
     pyctl pin    = known_hosts (client verifies server).
+  Access logs:   ACCESS lines go to access.log and stderr; they include
+                 conn_id, peer, command, session, status, body_bytes, not code.
   Crash containment: per-session worker processes; daemon tries to reap failed sessions.
 
 Auto-checkpoint:
   ~/.pythond/sessions/<name>/history.py -- successful execs only, replayable.
   ~/.pythond/sessions/<name>/session.log -- all activity including errors.
+  $runtime/pythond/access.log -- daemon access log, no tokens or code bodies.
 
 Output formats:
     new, kill, stop, ls        text
@@ -122,6 +126,7 @@ import ctypes
 import itertools
 import contextlib
 import typing
+import queue
 import wsproto
 from wsproto import ConnectionType
 from wsproto import events as ws_events
@@ -148,6 +153,10 @@ _WIN_ENABLE_PROCESSED_OUTPUT = 0x0001
 _WIN_ENABLE_WRAP_AT_EOL_OUTPUT = 0x0002
 _WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 _WS_CLOSE = object()
+_ACCESS_STDERR_QUEUE: queue.Queue[str] = queue.Queue(maxsize=1024)
+_ACCESS_STDERR_STARTED = False
+_ACCESS_STDERR_LOCK = threading.Lock()
+_ACCESS_CONN_SEQ = itertools.count(1)
 _CELL_SEQ = itertools.count()
 _INTERRUPT_LOCK = threading.Lock()
 _WORKER_SPAWN_LOCK = threading.Lock()
@@ -208,6 +217,113 @@ def _public_error(e: BaseException) -> str:
         return msg
     return e.__class__.__name__
 
+def _format_peer(peer: typing.Any) -> str:
+    """Format a WebSocket peer for logs without raising."""
+    if peer is None:
+        return "-"
+    if isinstance(peer, tuple):
+        return ":".join(str(x) for x in peer)
+    return str(peer)
+
+def _utc_timestamp_ms() -> str:
+    """Return an RFC3339-like UTC timestamp with millisecond precision."""
+    ns = time.time_ns()
+    sec = ns // 1_000_000_000
+    ms = (ns // 1_000_000) % 1000
+    return f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(sec))}.{ms:03d}Z"
+
+def _access_stderr_worker() -> None:
+    """Drain access log lines to stderr without blocking request threads."""
+    try:
+        fd = sys.stderr.fileno()
+    except (AttributeError, OSError, ValueError):
+        fd = None
+    while True:
+        line = _ACCESS_STDERR_QUEUE.get()
+        data = line.encode("utf-8", "replace")
+        try:
+            if fd is None:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+            else:
+                os.write(fd, data)
+        except Exception:
+            # stderr itself is broken or blocked; access.log remains durable.
+            pass
+
+def _ensure_access_stderr_worker() -> None:
+    """Start the bounded stderr mirror worker once."""
+    global _ACCESS_STDERR_STARTED
+    if _ACCESS_STDERR_STARTED:
+        return
+    with _ACCESS_STDERR_LOCK:
+        if _ACCESS_STDERR_STARTED:
+            return
+        t = threading.Thread(target=_access_stderr_worker, daemon=True)
+        t.start()
+        _ACCESS_STDERR_STARTED = True
+
+def _mirror_access_log_to_stderr(line: str) -> None:
+    """Best-effort stderr mirror without letting stderr block the daemon."""
+    _ensure_access_stderr_worker()
+    try:
+        _ACCESS_STDERR_QUEUE.put_nowait(line)
+    except queue.Full:
+        pass
+
+def _access_log(
+    event: str,
+    *,
+    conn_id: int | None = None,
+    peer: typing.Any = None,
+    cmd: str | None = None,
+    session: str | None = None,
+    status: str | None = None,
+    body_bytes: int | None = None,
+    detail: str | None = None,
+) -> None:
+    """Emit one access log line for daemon operations.
+
+    This daemon executes arbitrary Python.  Access logs must prove what surface
+    was used without leaking tokens or code bodies.  The file is durable local
+    evidence; stderr gives supervisors and service managers the live stream.
+    """
+    fields = [
+        "ACCESS",
+        f"ts={_utc_timestamp_ms()}",
+        f"event={event}",
+    ]
+    if conn_id is not None:
+        fields.append(f"conn_id={conn_id}")
+    fields.append(f"peer={_format_peer(peer)}")
+    if cmd is not None:
+        fields.append(f"cmd={cmd or '-'}")
+    if session is not None:
+        fields.append(f"session={session or '-'}")
+    if status is not None:
+        fields.append(f"status={status}")
+    if body_bytes is not None:
+        fields.append(f"body_bytes={body_bytes}")
+    if detail is not None:
+        fields.append(f"detail={detail}")
+    line = " ".join(fields) + "\n"
+    try:
+        path = os.path.join(_runtime_dir(), "access.log")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        created = not os.path.exists(path)
+        fd = os.open(path, flags, 0o600) if sys.platform != "win32" else os.open(path, flags)
+        try:
+            os.write(fd, line.encode("utf-8", "replace"))
+            if created and sys.platform != "win32":
+                os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print(f"WARN: access log failed: {e}", file=sys.stderr)
+    _mirror_access_log_to_stderr(line)
+
 def _ensure_private_dir(path: str) -> str:
     """Create a daemon data directory and restrict it to the current user."""
     created = not os.path.isdir(path)
@@ -244,8 +360,8 @@ def _log_history(name: str, src: str) -> None:
                      0o600 if sys.platform != "win32" else 0o666)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(f"\n# [{time.strftime('%Y-%m-%d %H:%M:%S')}]\n{src}\n")
-    except OSError:
-        pass  # best-effort -- don't crash if log dir missing
+    except OSError as e:
+        print(f"WARN: history log failed for {name}: {e}", file=sys.stderr)
 
 def _log_session(name: str, src: str, output: str = "", error: bool = False) -> None:
     """Append all exec activity to session.log (human readable)."""
@@ -260,8 +376,8 @@ def _log_session(name: str, src: str, output: str = "", error: bool = False) -> 
             if output:
                 for line in output.splitlines():
                     f.write(f"# > {line}\n")
-    except OSError:
-        pass  # best-effort -- don't crash if log dir missing
+    except OSError as e:
+        print(f"WARN: session log failed for {name}: {e}", file=sys.stderr)
 
 # -----------------------------------------------
 # SOCKET helpers
@@ -287,10 +403,9 @@ def _secure_path_win32(path: str) -> None:
             "/grant:r", "BUILTIN\\Administrators:(OI)(CI)(F)",
         ], check=True, capture_output=True, timeout=10)
     except (FileNotFoundError, subprocess.CalledProcessError,
-            subprocess.TimeoutExpired):
-        # icacls not available (shouldn't happen on Win10+)
-        # fall back to user-level: at least restrict via token auth
-        pass
+            subprocess.TimeoutExpired) as e:
+        print(f"WARN: cannot set DACL on {path}: {e.__class__.__name__}",
+              file=sys.stderr)
 
 def _runtime_dir() -> str:
     """Return the private runtime directory for daemon metadata."""
@@ -413,8 +528,9 @@ def _remove_daemon_meta() -> None:
         os.remove(_daemon_meta_path())
     except FileNotFoundError:
         pass  # already gone -- nothing to remove
-    except OSError:
-        pass  # cleanup -- don't crash on unlink failure
+    except OSError as e:
+        print(f"WARN: cannot remove {_daemon_meta_path()}: {e}",
+              file=sys.stderr)
 
 # -----------------------------------------------
 # TLS (optional, for --listen remote mode)
@@ -672,8 +788,9 @@ class _TlsTerminatedServer:
             inner_sock = socket.create_connection(("127.0.0.1",
                                                    self._inner_port))
             self._bridge(tls_sock, inner_sock)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"WARN: TLS connection failed: {e.__class__.__name__}",
+                  file=sys.stderr)
         finally:
             for sock in (tls_sock, inner_sock, raw):
                 if sock is None:
@@ -970,8 +1087,8 @@ def _dispatch(
             try:
                 os.set_inheritable(r_fd, False)
                 os.set_inheritable(w_fd, False)
-            except OSError:
-                pass
+            except OSError as e:
+                print(f"WARN: set_inheritable failed: {e}", file=sys.stderr)
             # Snapshot and fork under the same lock so the diff base and child
             # image match.  The child releases its inherited copy immediately
             # before evaluating user code.
@@ -1056,8 +1173,8 @@ def _dispatch(
                     if not chunk:
                         break
                     chunks.append(chunk)
-            except OSError:
-                pass  # pipe broken -- child died before finishing write
+            except OSError as e:
+                print(f"WARN: fork pipe broken: {e}", file=sys.stderr)
             finally:
                 try:
                     os.close(fd)
@@ -1666,8 +1783,9 @@ def _monitor_session(name: str) -> None:
                 s["proc"].wait()
         else:
             s["proc"].join()
-    except Exception:
-        pass  # process exited abnormally -- still need to reap
+    except Exception as e:
+        print(f"WARN: session {name} exited abnormally: {e}",
+              file=sys.stderr)
     with _session_lock(s):
         with _sessions_lock:
             if sessions.get(name) is not s:
@@ -1770,8 +1888,8 @@ def _client_ssl_ctx() -> _ssl.SSLContext:
         key = os.path.join(_tls_dir(), "key.pem")
         if os.path.exists(cert) and os.path.exists(key):
             ctx.load_cert_chain(cert, key)
-    except (_ssl.SSLError, OSError):
-        pass  # client cert optional -- skip if absent or broken
+    except (_ssl.SSLError, OSError) as e:
+        print(f"WARN: client cert load failed: {e}", file=sys.stderr)
     return ctx
 
 
@@ -2099,7 +2217,9 @@ def connect_remote(
         resp = ws.recv(timeout=5)
         if resp == "ERR auth failed":
             return "ERR auth failed on remote"
-    except Exception:
+    except Exception as e:
+        print(f"WARN: remote connect probe failed for {name}: {e.__class__.__name__}",
+              file=sys.stderr)
         return "ERR cannot reach remote"
     finally:
         if ws is not None:
@@ -2421,6 +2541,9 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
 
     # --- connection handler (one thread per connection) ---
     def _ws_handler(ws: WebSocketLike) -> None:
+        peer = getattr(ws, "remote_address", None)
+        conn_id = next(_ACCESS_CONN_SEQ)
+        _access_log("connect", conn_id=conn_id, peer=peer)
         # auth check for TCP mode
         if _daemon_token:
             auth = ws.request.headers.get("Authorization", "")
@@ -2428,74 +2551,106 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
             if auth.startswith("Bearer "):
                 token = auth[len("Bearer "):]
             if not hmac.compare_digest(token or "", _daemon_token):
+                _access_log("auth", conn_id=conn_id, peer=peer, status="rejected")
                 try:
                     ws.send("ERR auth failed")
-                except Exception:
-                    pass  # connection already dead -- can't send auth error
+                except Exception as e:
+                    print(f"WARN: auth failure response failed: {e.__class__.__name__}",
+                          file=sys.stderr)
+                print(f"WARN: auth rejected from {peer}", file=sys.stderr)
                 return
+            _access_log("auth", conn_id=conn_id, peer=peer, status="ok")
         # keep-alive: handle multiple messages per connection
-        for raw in ws:
-            if isinstance(raw, bytes):
-                ws.send("ERR binary frame not allowed in command mode")
-                continue
-            # protocol: "cmd arg1 arg2\nbody"
-            if "\n" in raw:
-                header, body = raw.split("\n", 1)
-                has_body = True
-            else:
-                header, body = raw, ""
-                has_body = False
-            parts = header.split()
-            cmd = parts[0] if parts else ""
-            args = parts[1:]
-            if has_body:
-                args.append(body)
+        try:
+            for raw in ws:
+                if isinstance(raw, bytes):
+                    _access_log("command", conn_id=conn_id, peer=peer, status="rejected",
+                                detail="binary-frame")
+                    ws.send("ERR binary frame not allowed in command mode")
+                    continue
+                # protocol: "cmd arg1 arg2\nbody"
+                if "\n" in raw:
+                    header, body = raw.split("\n", 1)
+                    has_body = True
+                else:
+                    header, body = raw, ""
+                    has_body = False
+                parts = header.split()
+                cmd = parts[0] if parts else ""
+                args = parts[1:]
+                if has_body:
+                    args.append(body)
+                session_name = args[0] if args else ""
+                body_len = len(body.encode("utf-8", "replace")) if has_body else 0
+                _access_log("command", conn_id=conn_id, peer=peer, cmd=cmd,
+                            session=session_name, body_bytes=body_len)
 
-            # attach: switch to binary frame mode for PTY
-            if cmd == "attach" and args:
-                aname = args[0]
-                s = _get_session(aname)
-                if s is None:
-                    ws.send(f"ERR no session '{aname}'")
-                    continue
-                bridge = s.get("bridge")
-                if not bridge:
-                    ws.send(f"ERR session '{aname}' has no PTY")
-                    continue
-                if len(args) >= 3:
-                    resize_resp = _handle_resize([aname, args[1], args[2]])
-                    if resize_resp != "OK":
-                        ws.send(resize_resp)
+                # attach: switch to binary frame mode for PTY
+                if cmd == "attach" and args:
+                    aname = args[0]
+                    s = _get_session(aname)
+                    if s is None:
+                        _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
+                                    status="no-session")
+                        ws.send(f"ERR no session '{aname}'")
                         continue
-                owner = bridge.attach(lambda data: ws.send(data))
-                if owner is None:
-                    ws.send(f"ERR session '{aname}' already attached")
-                    continue
-                try:
-                    ws.send("OK attached")
-                    for frame in ws:
-                        if isinstance(frame, str):
-                            if frame.strip() in ("detach", ""):
-                                break
+                    bridge = s.get("bridge")
+                    if not bridge:
+                        _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
+                                    status="no-pty")
+                        ws.send(f"ERR session '{aname}' has no PTY")
+                        continue
+                    if len(args) >= 3:
+                        resize_resp = _handle_resize([aname, args[1], args[2]])
+                        if resize_resp != "OK":
+                            _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
+                                        status="resize-failed")
+                            ws.send(resize_resp)
                             continue
-                        bridge.write(frame)  # binary -> PTY
-                finally:
-                    bridge.detach(owner)
+                    owner = bridge.attach(lambda data: ws.send(data))
+                    if owner is None:
+                        _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
+                                    status="busy")
+                        ws.send(f"ERR session '{aname}' already attached")
+                        continue
                     try:
-                        ws.send("OK detached")
-                    except Exception:
-                        pass  # detach ack failed -- connection closing anyway
-                return  # connection done after attach/detach
+                        _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
+                                    status="ok")
+                        ws.send("OK attached")
+                        for frame in ws:
+                            if isinstance(frame, str):
+                                if frame.strip() in ("detach", ""):
+                                    break
+                                continue
+                            bridge.write(frame)  # binary -> PTY
+                    finally:
+                        bridge.detach(owner)
+                        _access_log("detach", conn_id=conn_id, peer=peer, session=aname,
+                                    status="ok")
+                        try:
+                            ws.send("OK detached")
+                        except Exception:
+                            pass  # detach ack failed -- connection closing anyway
+                    return  # connection done after attach/detach
 
-            try:
-                resp = handle_client(cmd, args)
-            except Exception:
-                traceback.print_exc(file=sys.stderr)
-                resp = "ERR internal error"
-            try:
-                ws.send(resp or "")
-            except Exception:
-                break
+                try:
+                    resp = handle_client(cmd, args)
+                    status = "error" if resp.startswith("ERR ") else "ok"
+                except Exception:
+                    traceback.print_exc(file=sys.stderr)
+                    resp = "ERR internal error"
+                    status = "internal-error"
+                _access_log("result", conn_id=conn_id, peer=peer, cmd=cmd,
+                            session=session_name, status=status)
+                try:
+                    ws.send(resp or "")
+                except Exception as e:
+                    _access_log("result", conn_id=conn_id, peer=peer, cmd=cmd,
+                                session=session_name, status="send-failed",
+                                detail=e.__class__.__name__)
+                    break
+        finally:
+            _access_log("disconnect", conn_id=conn_id, peer=peer)
 
     # --- start server ---
     mode = "winpty" if _WinPty else "pty"
@@ -2714,8 +2869,10 @@ def _attach_reader(ws: WebSocketLike, stopped: threading.Event) -> None:
                 if "detached" in frame:
                     break
                 print(frame, file=sys.stderr)
-    except Exception:
-        pass  # connection closing -- send/close may fail
+    except Exception as e:
+        if not stopped.is_set():
+            print(f"WARN: attach reader failed: {e.__class__.__name__}",
+                  file=sys.stderr)
     stopped.set()
 
 

@@ -222,11 +222,53 @@ pysh run work "exec(open(os.path.expanduser('~/.pythond/sessions/work/history.py
 
 ## Security
 
+The security model mirrors SSH:
+
+| pythond | SSH equivalent |
+|---------|---------------|
+| token in `daemon.json` | private key in `~/.ssh/` |
+| `pyctl trust cert.pem` | adding a line to `authorized_keys` |
+| `pyctl pin cert.pem` | adding a line to `known_hosts` |
+| authenticated client | logged-in user |
+
+Once authenticated, a client has full access to all sessions — there is no per-session permission isolation. This is the same as SSH: once you log in, you are that user with all their permissions.
+
 - **Not a sandbox**: code runs with the daemon user's OS permissions
 - **Local POSIX**: AF_UNIX socket with `0o600` permissions
-- **Local Windows**: OWNER RIGHTS DACL via `icacls` — process-tree isolation
+- **Local Windows**: OWNER RIGHTS DACL via `icacls` — owner-level isolation (comparable to Unix `chmod 700`)
 - **Remote**: TLS (Ed25519 self-signed cert) + token auth, with optional mTLS client cert and server pinning
+- **Access logs**: daemon writes `ACCESS` lines to runtime `access.log` and stderr for supervisors; logs include `conn_id`, peer, command, session, status, and `body_bytes`, but never token or code body
 - **Crash isolation**: 5-layer try/except + process isolation — exec errors never kill daemon
+
+## Operations
+
+Run the daemon in the foreground under your supervisor:
+
+```bash
+pythond daemon
+# or
+pyctl start --listen 0.0.0.0:7399 --tls
+```
+
+Operational signals:
+
+```bash
+pyctl status          # daemon pid, transport, and liveness
+pysh ls               # sessions known to the daemon
+pysh status work      # one session's worker health
+pyctl stop            # graceful daemon shutdown
+```
+
+Logs:
+
+- `ACCESS ...` lines are mirrored to stderr for systemd/supervisor/journald.
+- The same access events are appended to the runtime `access.log`.
+- Per-session activity goes to `~/.pythond/sessions/<name>/session.log`.
+- Successful replayable execs go to `~/.pythond/sessions/<name>/history.py`.
+
+Access logs are for daemon operations: connection id, peer, command, session,
+status, and body size. They deliberately do not record tokens or Python source.
+Use `session.log` when you need the executed code and output.
 
 ## Cross-platform
 

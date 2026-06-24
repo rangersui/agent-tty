@@ -810,10 +810,29 @@ def test_wspro_client_payload_limit():
 def test_tls_and_auth_hardening_static():
     section("TLS/auth hardening")
     src = (ROOT / "pythond.py").read_text(encoding="utf-8")
+    access_log_seg = src[src.index("def _access_log("):src.index("def _ensure_private_dir(")]
+    access_mirror_seg = src[src.index("def _access_stderr_worker("):src.index("def _access_log(")]
     check("constant-time token compare", "hmac.compare_digest" in src)
     check("mTLS keeps token auth", "addition to token auth" in src)
     check("binary command frame returns error",
           "ERR binary frame not allowed in command mode" in src)
+    check("access log helper avoids code and token",
+          "def _access_log(" in src and
+          "body_bytes" in access_log_seg and
+          "Authorization" not in access_log_seg and
+          "code bodies" in access_log_seg)
+    check("access log has conn id and millisecond timestamps",
+          "_ACCESS_CONN_SEQ = itertools.count(1)" in src and
+          "def _utc_timestamp_ms(" in src and
+          "time.time_ns()" in src and
+          "conn_id" in access_log_seg)
+    check("access log fchmod only on create",
+          "created = not os.path.exists(path)" in access_log_seg and
+          "if created and sys.platform != \"win32\":" in access_log_seg)
+    check("access log mirrors to stderr",
+          "_ACCESS_STDERR_QUEUE.put_nowait(line)" in access_mirror_seg and
+          "threading.Thread(target=_access_stderr_worker, daemon=True)" in access_mirror_seg and
+          "sys.stderr.write(line)" in access_mirror_seg)
     ctx = pythond._client_ssl_ctx()
     check("client TLS minimum 1.2",
           getattr(ctx, "minimum_version", None) >= pythond._ssl.TLSVersion.TLSv1_2)
@@ -827,6 +846,7 @@ def test_connection_hardening_static():
     send_seg = src[src.index("def _send("):src.index("def client(")]
     handle_seg = src[src.index("def handle_client("):src.index("def daemon(")]
     daemon_seg = src[src.index("def daemon("):src.index("    # --- start server ---")]
+    daemon_full_seg = src[src.index("def daemon("):src.index("# =============================================\n# CLIENT")]
     runtime_seg = src[src.index("def _runtime_dir("):src.index("def _daemon_meta_path(")]
     tls_seg = src[src.index("def _tls_dir("):src.index("def _generate_cert(")]
     private_dir_seg = src[src.index("def _ensure_private_dir("):src.index("def _session_dir(")]
@@ -854,7 +874,6 @@ def test_connection_hardening_static():
     attach_loop_seg = src[src.index("def _attach_ws_loop("):src.index("def _attach_ws_pty(")]
     attach_win_seg = src[src.index("def _attach_ws_win("):src.index("def _mp_init(")]
     connect_daemon_seg = src[src.index("def _connect_daemon("):src.index("def _build_wire_message(")]
-    daemon_full_seg = src[src.index("def daemon("):src.index("# =============================================\n# CLIENT")]
     client_start = src.index("def client(")
     client_seg = src[client_start:src.index("def attach(", client_start)]
     pyctl_seg = src[src.index("def pyctl_main("):src.index("if __name__ == \"__main__\":")]
@@ -1103,6 +1122,17 @@ def test_connection_hardening_static():
           "add_argument(\"--listen\", metavar=\"HOST:PORT\"" in src)
     check("client-visible runtime errors are sanitized",
           "_public_error(e)" in src and "return f\"ERR {e}\"" not in src)
+    check("daemon access logs RCE surface",
+          "_access_log(\"connect\"" in daemon_full_seg and
+          "_access_log(\"auth\"" in daemon_full_seg and
+          "_access_log(\"command\"" in daemon_full_seg and
+          "_access_log(\"result\"" in daemon_full_seg and
+          "_access_log(\"disconnect\"" in daemon_full_seg and
+          "conn_id=conn_id" in daemon_full_seg)
+    check("daemon command access log omits body content",
+          "body_len = len(body.encode" in daemon_full_seg and
+          "body_bytes=body_len" in daemon_full_seg and
+          "detail=body" not in daemon_full_seg)
 
 
 def test_has_crypto_flag():
@@ -1194,8 +1224,8 @@ def send_cmd(addr, cmd, args=None, token=None):
         return resp
     try:
         resp = ws.recv(timeout=10)
-    except Exception:
-        resp = "OK"  # connection closed (e.g. stop command)
+    except Exception as e:
+        resp = "OK" if cmd == "stop" else str(e)
     try:
         ws.close()
     except Exception:
@@ -1367,6 +1397,14 @@ def test_integration_tcp_windows():
             [sys.executable, str(ROOT / "pythond.py"), "daemon"],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
+        stderr_chunks = []
+        def _drain_stderr():
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                stderr_chunks.append(line)
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
         time.sleep(1.0)
         check("tcp daemon started", proc.poll() is None)
 
@@ -1430,10 +1468,61 @@ def test_integration_tcp_windows():
             bad = send_cmd(f"127.0.0.1:{port}", "ls", token="wrong-token")
             check("tcp wrong token rejected", "ERR auth failed" in bad, bad)
 
+            access_path = os.path.join(runtime, "access.log")
+            access = open(access_path, encoding="utf-8").read()
+            access_lines = [
+                line for line in access.splitlines()
+                if line.startswith("ACCESS ")
+            ]
+            check("tcp access log written",
+                  "ACCESS" in access and
+                  "event=command" in access and
+                  "event=result" in access,
+                  access[:300])
+            check("tcp access log has conn ids",
+                  bool(access_lines) and
+                  all("conn_id=" in line for line in access_lines),
+                  access[:300])
+            ts_values = [
+                line.split("ts=", 1)[1].split()[0]
+                for line in access_lines if "ts=" in line
+            ]
+            check("tcp access log timestamp has milliseconds",
+                  bool(ts_values) and
+                  all(len(ts) == len("2026-06-24T13:39:35.123Z") and
+                      ts[19] == "." and ts.endswith("Z")
+                      for ts in ts_values),
+                  access[:300])
+            check("tcp access log auth reject",
+                  "event=auth" in access and "status=rejected" in access,
+                  access[:300])
+            check("tcp access log records body size",
+                  "body_bytes=" in access, access[:300])
+            check("tcp access log omits code and token",
+                  "x = 41" not in access and
+                  "print('Traceback')" not in access and
+                  str(token) not in access,
+                  access[:300])
+
             resp = send_cmd(f"127.0.0.1:{port}", "stop", token=token)
             check("tcp stop OK", "OK" in resp, resp)
             time.sleep(0.5)
             check("tcp daemon exited", proc.poll() is not None)
+            if proc.poll() is not None and proc.stderr is not None:
+                stderr_thread.join(timeout=2)
+                stderr = "".join(stderr_chunks)
+                stderr_access = "\n".join(
+                    line for line in stderr.splitlines()
+                    if line.startswith("ACCESS ")
+                )
+                check("tcp access log mirrored to stderr",
+                      "ACCESS" in stderr_access and "event=command" in stderr_access,
+                      stderr[:300])
+                check("tcp stderr access log omits code and token",
+                      "x = 41" not in stderr_access and
+                      "print('Traceback')" not in stderr_access and
+                      str(token) not in stderr_access,
+                      stderr_access[:300])
         finally:
             if proc.poll() is None:
                 proc.terminate()
