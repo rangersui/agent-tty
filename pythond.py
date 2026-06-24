@@ -140,7 +140,15 @@ __version__ = "0.3.0"
 JsonDict = dict[str, typing.Any]
 WebSocketLike = typing.Any
 SocketLike = typing.Any
-_WS_PROTO: typing.Any = f"pythond.{__version__[:3]}"   # e.g. "pythond.0.3"
+
+def _protocol_version(version: str) -> str:
+    """Return the WebSocket protocol version as major.minor."""
+    match = re.match(r"^(\d+)\.(\d+)(?:\.|$)", version)
+    if not match:
+        raise RuntimeError(f"invalid version: {version}")
+    return f"{match.group(1)}.{match.group(2)}"
+
+_WS_PROTO: typing.Any = f"pythond.{_protocol_version(__version__)}"
 _WS_HELLO = "tis but a scratch"
 _MAX_SESSIONS = int(os.environ.get("PYTHOND_MAX_SESSIONS", "128"))
 _MAX_WS_PAYLOAD = int(os.environ.get("PYTHOND_MAX_WS_PAYLOAD", str(16 * 1024 * 1024)))
@@ -3093,8 +3101,14 @@ def _send(cmd: str, args: list[str]) -> str | None:
         if resp is _WS_CLOSE:
             ws.close()
             return None
+        if isinstance(resp, bytes):
+            ws.close()
+            return "ERR binary response not allowed in command mode"
+        if not isinstance(resp, str):
+            ws.close()
+            return "ERR invalid daemon response"
         ws.close()
-        return typing.cast(str, resp)
+        return resp
     except Exception:
         try:
             ws.close()

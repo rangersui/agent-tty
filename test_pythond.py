@@ -53,6 +53,12 @@ def test_version():
     check("version is string", isinstance(pythond.__version__, str))
     check("version has dots", "." in pythond.__version__)
     check("version is 0.3.0", pythond.__version__ == "0.3.0")
+    check("protocol version keeps two-digit minor",
+          pythond._protocol_version("1.10.0") == "1.10")
+    check("protocol version accepts major minor",
+          pythond._protocol_version("2.0") == "2.0")
+    check("ws protocol uses parsed major minor",
+          pythond._WS_PROTO == "pythond.0.3")
 
 
 def test_listen_addr_parsing():
@@ -1204,6 +1210,9 @@ def test_connection_hardening_static():
           "_public_error(e)" in attach_seg)
     check("send uses shared daemon connector", "_connect_daemon(" in send_seg)
     check("send recv is bounded", "ws.recv(timeout=30)" in send_seg)
+    check("send rejects binary command responses",
+          "isinstance(resp, bytes)" in send_seg and
+          "ERR binary response not allowed in command mode" in send_seg)
     check("remote opens use helper", "def _open_remote_ws" in src)
     check("close frame has sentinel", "return _WS_CLOSE" in src)
     check("wsproto is used for WSS framing",
@@ -1603,6 +1612,28 @@ def test_pyctl_status_uses_env_endpoint():
     check("status closed ws", fake.closed is True)
     check("status prints endpoint", "endpoint: 127.0.0.1:7399" in text, text)
     check("status prints alive true", "alive: True" in text, text)
+
+
+def test_send_rejects_binary_command_response():
+    section("_send rejects binary command response")
+
+    class FakeWs:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+        def send(self, msg):
+            self.sent.append(msg)
+        def recv(self, timeout=None):
+            return b"binary"
+        def close(self):
+            self.closed = True
+
+    fake = FakeWs()
+    with mock.patch.object(pythond, "_connect_daemon", return_value=fake):
+        resp = pythond._send("ls", [])
+    check("binary response becomes ERR",
+          resp == "ERR binary response not allowed in command mode", resp)
+    check("binary response closes ws", fake.closed is True)
 
 
 def test_default_sock():
@@ -2559,6 +2590,7 @@ def main():
         test_access_log_sanitises_session_field,
         test_pyctl_cert_role_hints,
         test_pyctl_status_uses_env_endpoint,
+        test_send_rejects_binary_command_response,
         test_default_sock,
         test_secure_path_win32,
 
