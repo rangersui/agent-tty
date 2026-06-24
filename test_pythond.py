@@ -849,10 +849,13 @@ def test_connection_hardening_static():
     attach_reader_seg = src[src.index("def _attach_reader("):src.index("def _attach_ws_loop(")]
     attach_loop_seg = src[src.index("def _attach_ws_loop("):src.index("def _attach_ws_pty(")]
     attach_win_seg = src[src.index("def _attach_ws_win("):src.index("def _mp_init(")]
+    connect_daemon_seg = src[src.index("def _connect_daemon("):src.index("def _build_wire_message(")]
+    daemon_full_seg = src[src.index("def daemon("):src.index("# =============================================\n# CLIENT")]
     client_start = src.index("def client(")
     client_seg = src[client_start:src.index("def attach(", client_start)]
     pyctl_seg = src[src.index("def pyctl_main("):src.index("if __name__ == \"__main__\":")]
     main_seg = src[src.index("def main("):src.index("def pysh_main(")]
+    pysh_seg = src[src.index("def pysh_main("):src.index("_PYCTL_HELP")]
 
     check("blocking send waits write-ready",
           "except (_ssl.SSLWantWriteError, BlockingIOError):\n"
@@ -892,6 +895,10 @@ def test_connection_hardening_static():
           "ws_events.TextMessage" in src and
           "ws_events.BytesMessage" in src and
           "ws_events.AcceptConnection" in src)
+    check("wsproto text send does not coerce payloads",
+          "TextMessage(data=data)" in wspro_seg and
+          "TextMessage(data=str(data))" not in wspro_seg and
+          "websocket payload must be str or bytes" in wspro_seg)
     check("wsproto close handles already closed state",
           "LocalProtocolError" in wspro_seg)
     check("wsproto close reply uses legal code",
@@ -999,6 +1006,23 @@ def test_connection_hardening_static():
           "remote response failed" in remote_seg and
           "remote send failed" in remote_seg and
           "if attempt == 0:\n                    continue" in remote_seg)
+    pre_host_seg = connect_daemon_seg.split("host = os.environ.get(\"PYTHOND_HOST\")", 1)[0]
+    check("daemon connector delays websockets import",
+          "from websockets.sync.client import unix_connect" not in pre_host_seg and
+          connect_daemon_seg.index("if host:") <
+          connect_daemon_seg.index("from websockets.sync.client import unix_connect"))
+    check("daemon server registered immediately",
+          "def _set_server(" in daemon_full_seg and
+          "_daemon_server = created" in daemon_full_seg and
+          "_daemon_server = server\n        server.serve_forever()" not in daemon_full_seg)
+    check("daemon clears token on shutdown",
+          "_daemon_token = None" in daemon_full_seg)
+    check("mp init only on daemon entry points",
+          main_seg.count("_mp_init()") == 1 and
+          "if argv[0] == \"daemon\":\n        _mp_init()" in main_seg and
+          "_mp_init()" not in pysh_seg and
+          pyctl_seg.count("_mp_init()") == 1 and
+          "if argv[0] == \"start\":\n        _mp_init()" in pyctl_seg)
     check("remote resize fails explicitly",
           "resize not supported for remote sessions" in resize_seg)
     check("attach reader uses bounded recv",

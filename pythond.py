@@ -1802,8 +1802,10 @@ class _WsproClient:
     def send(self, data: str | bytes) -> None:
         if isinstance(data, bytes):
             payload = self.ws.send(ws_events.BytesMessage(data=data))
+        elif isinstance(data, str):
+            payload = self.ws.send(ws_events.TextMessage(data=data))
         else:
-            payload = self.ws.send(ws_events.TextMessage(data=str(data)))
+            raise TypeError("websocket payload must be str or bytes")
         self.sock.sendall(payload)
 
     def recv(self, timeout: float | None = None) -> str | bytes | object:
@@ -1939,12 +1941,6 @@ def _open_remote_ws(
 
 def _connect_daemon(timeout: float = 5) -> WebSocketLike:
     """Open a client connection to the configured local or remote daemon."""
-    try:
-        if _HAS_AF_UNIX:
-            from websockets.sync.client import unix_connect as ws_unix_connect
-    except ImportError:
-        raise RuntimeError("websockets required: pip install pythond")
-
     host = os.environ.get("PYTHOND_HOST")
     use_tls = os.environ.get("PYTHOND_TLS", "").lower() in ("1", "true", "yes")
     token = os.environ.get("PYTHOND_TOKEN")
@@ -1953,6 +1949,10 @@ def _connect_daemon(timeout: float = 5) -> WebSocketLike:
         h, port = _parse_host_port(host)
         return _open_remote_ws(h, port, token, use_tls=use_tls, timeout=timeout)
     if _HAS_AF_UNIX:
+        try:
+            from websockets.sync.client import unix_connect as ws_unix_connect
+        except ImportError:
+            raise RuntimeError("websockets required for local AF_UNIX connections: pip install pythond")
         return ws_unix_connect(SOCK, open_timeout=timeout, close_timeout=2,
                                subprotocols=[_WS_PROTO])
 
@@ -2466,6 +2466,13 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
     mode = "winpty" if _WinPty else "pty"
     server: _Servable | None = None
 
+    def _set_server(created: _Servable) -> _Servable:
+        nonlocal server
+        global _daemon_server
+        server = created
+        _daemon_server = created
+        return created
+
     def _stop(signum: int, frame: typing.Any) -> None:
         if server:
             threading.Thread(target=server.shutdown, daemon=True).start()
@@ -2488,8 +2495,10 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                   file=sys.stderr)
             old_umask = os.umask(0o177)
             try:
-                server = ws_unix_serve(_ws_handler, SOCK,
-                                       subprotocols=[_WS_PROTO])
+                server = _set_server(
+                    ws_unix_serve(_ws_handler, SOCK,
+                                  subprotocols=[_WS_PROTO])
+                )
             finally:
                 os.umask(old_umask)
             os.chmod(SOCK, 0o600)
@@ -2508,21 +2517,28 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                 print(f"mtls: {n} trusted client cert(s)", file=sys.stderr)
             if tls:
                 assert ssl_ctx is not None
-                server = _TlsTerminatedServer(ws_serve, _ws_handler, host,
-                                              port, ssl_ctx, [_WS_PROTO])
+                server = _set_server(
+                    _TlsTerminatedServer(ws_serve, _ws_handler, host,
+                                         port, ssl_ctx, [_WS_PROTO])
+                )
             else:
-                server = ws_serve(_ws_handler, host, port,
-                                  subprotocols=[_WS_PROTO])
+                server = _set_server(
+                    ws_serve(_ws_handler, host, port,
+                             subprotocols=[_WS_PROTO])
+                )
         else:
             print(f"pythond pid={os.getpid()} ws://127.0.0.1:{port} mode={mode}",
                   file=sys.stderr)
             if show_token:
                 tok_cmd = "set" if sys.platform == "win32" else "export"
                 print(f"{tok_cmd} PYTHOND_TOKEN={_daemon_token}", file=sys.stderr)
-            server = ws_serve(_ws_handler, "127.0.0.1", port,
-                              subprotocols=[_WS_PROTO])
+            server = _set_server(
+                ws_serve(_ws_handler, "127.0.0.1", port,
+                         subprotocols=[_WS_PROTO])
+            )
 
-        _daemon_server = server
+        if server is None:
+            raise RuntimeError("server did not start")
         server.serve_forever()
 
     except KeyboardInterrupt:
@@ -2554,6 +2570,7 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
         if not use_unix and not listen_addr:
             _remove_daemon_meta()
         _daemon_server = None
+        _daemon_token = None
 
 # =============================================
 # CLIENT
@@ -2809,7 +2826,6 @@ def _worker_entry(argv: list[str]) -> bool:
 
 def main() -> None:
     """Entry point for `pythond` command -- full command set."""
-    _mp_init()
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__.encode(sys.stdout.encoding or "utf-8", "replace").decode(sys.stdout.encoding or "utf-8", "replace"))
@@ -2826,6 +2842,7 @@ def main() -> None:
             sys.exit(1)
         return
     if argv[0] == "daemon":
+        _mp_init()
         show = "--show-token" in argv
         listen = None
         use_tls = "--tls" in argv
@@ -2866,7 +2883,6 @@ Once connected, pysh run/fire/fork/poll work transparently.
 
 def pysh_main() -> None:
     """Entry point for `pysh` command -- session commands."""
-    _mp_init()
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help"):
         print(_PYSH_HELP)
@@ -2904,7 +2920,6 @@ Architecture:
 
 def pyctl_main() -> None:
     """Entry point for `pyctl` command -- daemon management."""
-    _mp_init()
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help"):
         print(_PYCTL_HELP)
@@ -2913,6 +2928,7 @@ def pyctl_main() -> None:
         print(f"pythond {__version__}")
         sys.exit(0)
     if argv[0] == "start":
+        _mp_init()
         show = "--show-token" in argv
         listen = None
         use_tls = "--tls" in argv
