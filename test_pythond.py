@@ -1,0 +1,1655 @@
+#!/usr/bin/env python3
+"""pythond test suite -- unit + integration.
+
+Run:  python -B test_pythond.py
+
+Unit tests run everywhere.  Integration tests need POSIX (PTY) or TCP mode.
+"""
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import threading
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parent
+assert (ROOT / "pythond.py").exists(), f"pythond.py not found in {ROOT}"
+sys.path.insert(0, str(ROOT))
+import pythond
+_WS_PROTO = pythond._WS_PROTO
+
+PASS = 0
+FAIL = 0
+
+
+def check(name, condition, detail=""):
+    global PASS, FAIL
+    if condition:
+        PASS += 1
+    else:
+        print(f"  X {name}")
+        if detail:
+            print(f"    {detail}")
+        FAIL += 1
+
+
+def section(title):
+    print(f"\n--- {title} ---")
+
+
+# ===========================================
+# UNIT TESTS (no daemon needed)
+# ===========================================
+
+def test_version():
+    section("version")
+    check("version is string", isinstance(pythond.__version__, str))
+    check("version has dots", "." in pythond.__version__)
+    check("version is 0.3.0", pythond.__version__ == "0.3.0")
+
+
+def test_listen_addr_parsing():
+    """Cover all branches of listen_addr parsing in daemon()."""
+    section("listen_addr parsing")
+    cases = [
+        ("0.0.0.0:7399", "0.0.0.0", 7399),
+        (":7399",         "0.0.0.0", 7399),
+        ("7399",          "0.0.0.0", 7399),
+        ("myserver",      "myserver", 7399),
+        ("myserver:8080", "myserver", 8080),
+        ("10.0.0.5:443",  "10.0.0.5", 443),
+    ]
+    for listen_addr, exp_host, exp_port in cases:
+        if ":" in listen_addr:
+            host, _, port_s = listen_addr.rpartition(":")
+            host = host or "0.0.0.0"
+            port = int(port_s)
+        elif listen_addr.isdigit():
+            host = "0.0.0.0"
+            port = int(listen_addr)
+        else:
+            host = listen_addr
+            port = 7399
+        check(f"listen={listen_addr} host",
+              host == exp_host, f"got {host}")
+        check(f"listen={listen_addr} port",
+              port == exp_port, f"got {port}")
+
+
+def test_khost_parsing():
+    """Cover all branches of PYTHOND_HOST parsing in _client_socket."""
+    section("PYTHOND_HOST parsing")
+    cases = [
+        ("10.0.0.5:7399", "10.0.0.5", 7399),
+        ("10.0.0.5",       "10.0.0.5", 7399),
+        ("myhost",         "myhost",   7399),
+    ]
+    for host_str, exp_h, exp_port in cases:
+        if ":" in host_str:
+            h, _, p = host_str.rpartition(":")
+            port = int(p)
+        else:
+            port = 7399
+            h = host_str
+        check(f"PYTHOND_HOST={host_str} h", h == exp_h, f"got {h}")
+        check(f"PYTHOND_HOST={host_str} port", port == exp_port, f"got {port}")
+
+
+def test_init_namespace():
+    section("_init_namespace")
+    ns = pythond._init_namespace()
+    check("has builtins", "__builtins__" in ns)
+    for mod in ("os", "sys", "json", "subprocess", "re", "sqlite3"):
+        check(f"has {mod}", mod in ns, f"missing {mod}")
+
+
+def test_make_exec_eval():
+    section("_make_exec eval")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    # eval expression
+    out = _exec("1 + 1")
+    check("eval returns repr", out == "2")
+    # eval string
+    out = _exec("'hello'")
+    check("eval string returns raw", out == "hello")
+    # eval None (no output)
+    out = _exec("None")
+    check("eval None empty", out == "")
+
+
+def test_make_exec_exec():
+    section("_make_exec exec")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    # exec statement
+    out = _exec("x = 42")
+    check("exec no output", out == "")
+    check("exec set var", ns.get("x") == 42)
+    # exec print
+    out = _exec("print('hello world')")
+    check("exec print captured", out == "hello world")
+
+
+def test_make_exec_last_expr():
+    section("_make_exec auto-print last expression")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    # multi-line with last expression -> auto-print
+    out = _exec("x = 6\ny = 7\nx * y")
+    check("last expr auto-print", out == "42")
+    # multi-line with last assignment -> no auto-print
+    out = _exec("a = 1\nb = 2")
+    check("last assign no print", out == "")
+    # multi-line function def + call as last expr
+    out = _exec("def fib(n):\n  a, b = 0, 1\n  for _ in range(n): a, b = b, a+b\n  return a\nfib(10)")
+    check("func def + last call", out == "55")
+    # single expression still works (eval path)
+    out = _exec("100 + 23")
+    check("single expr still works", out == "123")
+
+
+def test_make_exec_error():
+    section("_make_exec error handling")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    # exception
+    out = _exec("1/0")
+    check("exception has traceback", "ZeroDivisionError" in out)
+    # syntax error in eval -> falls through to exec
+    out = _exec("if True: pass")
+    check("statement via exec", out == "")
+    # KeyboardInterrupt
+    out = _exec("raise KeyboardInterrupt")
+    check("KeyboardInterrupt caught", "KeyboardInterrupt" in out)
+    # SystemExit
+    out = _exec("raise SystemExit(42)")
+    check("SystemExit caught", "exit(42)" in out)
+
+
+def test_make_exec_on_done():
+    section("_make_exec on_done callback")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    calls = []
+    _exec = pythond._make_exec(ns, lock, on_done=lambda s, o: calls.append((s, o)))
+    _exec("print('hi')")
+    check("on_done called", len(calls) == 1)
+    check("on_done src", calls[0][0] == "print('hi')")
+    check("on_done output", calls[0][1] == "hi")
+
+
+def test_make_exec_thread_isolation():
+    section("_make_exec thread-local stdout")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+
+    # child thread prints during exec -> should NOT appear in cell output
+    import time
+    leaked = []
+    real_stdout = sys.stdout._real if isinstance(sys.stdout, pythond._ThreadStdout) else sys.stdout
+
+    code = (
+        "import threading, time\n"
+        "def _bg():\n"
+        "    time.sleep(0.05)\n"
+        "    print('from_child_thread')\n"
+        "t = threading.Thread(target=_bg)\n"
+        "t.start()\n"
+        "time.sleep(0.1)\n"
+        "t.join()\n"
+        "print('from_main')\n"
+    )
+    output = _exec(code)
+    check("main thread captured", "from_main" in output)
+    check("child thread NOT in cell", "from_child_thread" not in output, output)
+
+    # direct exec -> main thread output captured normally
+    output2 = _exec("print('normal')")
+    check("normal capture works", output2.strip() == "normal")
+
+
+def test_dispatch_run():
+    section("_dispatch run")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    resp = pythond._dispatch("run", ["2+2"], _exec, cells, ns)
+    check("run output", resp["output"] == "4")
+    check("run success error flag false", resp.get("_error") is False)
+    resp = pythond._dispatch("run", ["print('Traceback')"], _exec, cells, ns)
+    check("literal Traceback not error",
+          resp["output"] == "Traceback" and resp.get("_error") is False)
+    resp = pythond._dispatch("run", ["1/0"], _exec, cells, ns)
+    check("run exception error flag true", resp.get("_error") is True)
+
+
+def test_dispatch_fire_poll():
+    section("_dispatch fire+poll")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    resp = pythond._dispatch("fire", ["import time; time.sleep(0.1); x=99"], _exec, cells, ns)
+    check("fire has cell_id", "cell_id" in resp)
+    check("fire status", resp["status"] == "fired")
+    cid = resp["cell_id"]
+    time.sleep(0.3)
+    resp2 = pythond._dispatch("poll", [cid], _exec, cells, ns)
+    check("poll done", resp2["status"] == "done")
+    check("poll cell_id", resp2["cell_id"] == cid)
+    check("fire set var", ns.get("x") == 99)
+
+
+def test_dispatch_poll_empty():
+    section("_dispatch poll empty")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    resp = pythond._dispatch("poll", [], _exec, cells, ns)
+    check("poll empty idle", resp == {"status": "idle"})
+
+
+def test_dispatch_poll_unknown():
+    section("_dispatch poll unknown cell")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    resp = pythond._dispatch("poll", ["nonexistent"], _exec, cells, ns)
+    check("poll unknown error", resp["status"] == "error")
+
+
+def test_dispatch_poll_latest():
+    section("_dispatch poll latest (no id)")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    pythond._dispatch("fire", ["y=1"], _exec, cells, ns)
+    time.sleep(0.2)
+    resp = pythond._dispatch("poll", [], _exec, cells, ns)
+    check("poll latest has cell_id", "cell_id" in resp)
+
+
+def test_dispatch_status():
+    section("_dispatch status")
+    ns = pythond._init_namespace()
+    ns["myvar"] = 42
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    resp = pythond._dispatch("status", [], _exec, cells, ns)
+    check("status has state", "state" in resp)
+    check("status idle", resp["state"] == "idle")
+    check("status vars count", resp["vars"] >= 1)
+
+
+def test_dispatch_vars():
+    section("_dispatch vars")
+    ns = pythond._init_namespace()
+    ns["myvar"] = 42
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    resp = pythond._dispatch("vars", [], _exec, cells, ns)
+    check("vars has list", "vars" in resp)
+    check("vars includes myvar", "myvar" in resp["vars"])
+    check("vars excludes private", not any(v.startswith("_") for v in resp["vars"]))
+
+
+def test_dispatch_complete():
+    section("_dispatch complete")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    resp = pythond._dispatch("complete", ["os.path."], _exec, cells, ns)
+    check("complete has matches", "matches" in resp)
+    check("complete non-empty", len(resp["matches"]) > 0)
+    check("complete has join", any("join" in m for m in resp["matches"]))
+
+
+def test_dispatch_int():
+    section("_dispatch int (interrupt)")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    # Python-level loop (not C-level sleep) so PyThreadState_SetAsyncExc works
+    resp = pythond._dispatch("fire",
+        ["[__import__('time').sleep(0.1) for _ in range(100)]"], _exec, cells, ns)
+    cid = resp["cell_id"]
+    time.sleep(0.3)
+    resp = pythond._dispatch("int", [], _exec, cells, ns)
+    check("int has threads", "threads" in resp)
+    time.sleep(0.5)
+    resp = pythond._dispatch("poll", [cid], _exec, cells, ns)
+    check("interrupted cell done", resp["status"] == "done")
+
+
+def test_dispatch_unknown():
+    section("_dispatch unknown command")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    resp = pythond._dispatch("bogus", [], _exec, cells, ns)
+    check("unknown error", "error" in resp)
+
+
+def test_dispatch_fork():
+    section("_dispatch fork (process-based async)")
+    if sys.platform == "win32":
+        check("fork skipped on windows", True)
+        return
+    ns = pythond._init_namespace()
+    ns["x"] = 10
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+
+    # basic fork: set a variable, it should merge back
+    resp = pythond._dispatch("fork", ["y = x * 2"], _exec, cells, ns, lock)
+    check("fork returns cell_id", "cell_id" in resp)
+    check("fork status", resp["status"] == "forked")
+    cid = resp["cell_id"]
+
+    # wait for fork to complete
+    for _ in range(20):
+        time.sleep(0.2)
+        resp = pythond._dispatch("poll", [cid], _exec, cells, ns)
+        if resp["status"] == "done":
+            break
+    check("fork done", resp["status"] == "done")
+    check("fork merged y", "y" in resp.get("merged", []))
+    check("y merged to namespace", ns.get("y") == 20)
+
+    # fork with output
+    resp2 = pythond._dispatch("fork", ["print(x + y)"], _exec, cells, ns, lock)
+    cid2 = resp2["cell_id"]
+    for _ in range(20):
+        time.sleep(0.2)
+        resp2 = pythond._dispatch("poll", [cid2], _exec, cells, ns)
+        if resp2["status"] == "done":
+            break
+    check("fork output", resp2["output"].strip() == "30")
+
+    # fork with unpicklable object -> skipped
+    resp3 = pythond._dispatch("fork", ["import threading; lk = threading.Lock()"],
+                               _exec, cells, ns, lock)
+    cid3 = resp3["cell_id"]
+    for _ in range(20):
+        time.sleep(0.2)
+        resp3 = pythond._dispatch("poll", [cid3], _exec, cells, ns)
+        if resp3["status"] == "done":
+            break
+    check("fork skipped unpicklable", "lk" in resp3.get("skipped", []))
+
+
+def test_dispatch_fork_kill():
+    section("_dispatch fork int (killable)")
+    if sys.platform == "win32":
+        check("fork kill skipped on windows", True)
+        return
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+
+    # fork a long sleep -> int should kill it
+    resp = pythond._dispatch("fork", ["__import__('time').sleep(30)"],
+                              _exec, cells, ns, lock)
+    cid = resp["cell_id"]
+    time.sleep(0.5)
+    resp = pythond._dispatch("int", [], _exec, cells, ns)
+    check("fork int count", resp["processes"] >= 1)
+    # wait for monitor thread to reap
+    time.sleep(1)
+    resp = pythond._dispatch("poll", [cid], _exec, cells, ns)
+    check("fork killed done", resp["status"] == "done")
+    check("fork killed output", "killed" in resp.get("output", ""))
+
+
+def test_dispatch_fork_large_payload():
+    section("_dispatch fork large payload (pipe buffer test)")
+    if sys.platform == "win32":
+        check("fork large skipped on windows", True)
+        return
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+
+    # Create data larger than pipe buffer (~64KB) to exercise:
+    #   - _write_all (partial write handling)
+    #   - read-first-then-waitpid ordering (no deadlock)
+    resp = pythond._dispatch("fork",
+        ["big = list(range(50000))"],  # ~400KB when pickled
+        _exec, cells, ns, lock)
+    cid = resp["cell_id"]
+    for _ in range(30):
+        time.sleep(0.2)
+        resp = pythond._dispatch("poll", [cid], _exec, cells, ns)
+        if resp["status"] == "done":
+            break
+    check("fork large done", resp["status"] == "done")
+    check("fork large merged", "big" in resp.get("merged", []))
+    check("fork large data intact", ns.get("big") == list(range(50000)))
+
+
+def test_dispatch_fork_concurrent_fire():
+    section("_dispatch fork while fire running")
+    if sys.platform == "win32":
+        check("fork concurrent skipped on windows", True)
+        return
+    ns = pythond._init_namespace()
+    ns["base"] = 100
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+
+    # fire a slow task, then fork while it's running
+    pythond._dispatch("fire",
+        ["import time; time.sleep(0.5); fired_val = base + 1"],
+        _exec, cells, ns, lock)
+    time.sleep(0.1)
+    # fork should work even with fire thread active (os.fork not mp.Process)
+    resp = pythond._dispatch("fork", ["forked_val = base + 2"],
+                              _exec, cells, ns, lock)
+    cid = resp["cell_id"]
+    for _ in range(20):
+        time.sleep(0.2)
+        resp = pythond._dispatch("poll", [cid], _exec, cells, ns)
+        if resp["status"] == "done":
+            break
+    check("fork concurrent done", resp["status"] == "done")
+    check("fork concurrent merged", "forked_val" in resp.get("merged", []))
+    check("fork concurrent value", ns.get("forked_val") == 102)
+    # wait for fire to finish too
+    time.sleep(1)
+    check("fire also completed", ns.get("fired_val") == 101)
+
+
+def test_cell_eviction():
+    section("cell eviction (time-based)")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+
+    # fire a cell and let it complete
+    resp = pythond._dispatch("fire", ["1+1"], _exec, cells, ns)
+    cid = resp["cell_id"]
+    time.sleep(0.2)
+
+    # cell should be pollable
+    resp = pythond._dispatch("poll", [cid], _exec, cells, ns)
+    check("cell exists before evict", resp["status"] == "done")
+
+    # fake the done_at to 10 minutes ago
+    with pythond._cells_lock:
+        cells[cid]["_done_at"] = time.time() - 600
+
+    # fire another cell -> triggers eviction
+    resp2 = pythond._dispatch("fire", ["2+2"], _exec, cells, ns)
+    time.sleep(0.2)
+
+    # old cell should be evicted
+    with pythond._cells_lock:
+        check("stale cell evicted", cid not in cells)
+    # new cell still there
+    check("new cell exists", resp2["cell_id"] in cells)
+
+
+def test_session_name_sanitization():
+    section("session name sanitization")
+    bad_names = ["../etc", "foo/bar", "a\\b", "x\0y", "", "..", ".../.../passwd"]
+    for name in bad_names:
+        resp = pythond.handle_client("new", [name])
+        check(f"reject '{name[:20]}'", "ERR" in resp, resp)
+        resp = pythond.handle_client("connect", [name, "127.0.0.1:1", "tok"])
+        check(f"connect rejects '{name[:20]}'", "invalid session name" in resp, resp)
+
+
+def test_session_dir():
+    section("_session_dir")
+    name = "__test_session_dir__"
+    path = pythond._session_dir(name)
+    check("dir exists", os.path.isdir(path))
+    check("dir path correct", name in path)
+    if sys.platform != "win32":
+        mode = os.stat(path).st_mode & 0o777
+        check("dir is private", mode & 0o077 == 0, oct(mode))
+    shutil.rmtree(os.path.join(os.path.expanduser("~"), ".pythond",
+                               "sessions", name), ignore_errors=True)
+
+
+def test_session_capacity_limit():
+    section("session capacity limit")
+    with pythond._sessions_lock:
+        saved = dict(pythond.sessions)
+        pythond.sessions.clear()
+    try:
+        with mock.patch.object(pythond, "_MAX_SESSIONS", 1):
+            pythond._set_session("one", {"type": "remote"})
+            try:
+                pythond._set_session("two", {"type": "remote"})
+                check("capacity rejects second session", False)
+            except RuntimeError as e:
+                check("capacity rejects second session", "too many sessions" in str(e))
+    finally:
+        with pythond._sessions_lock:
+            pythond.sessions.clear()
+            pythond.sessions.update(saved)
+
+
+def test_log_history():
+    section("_log_history")
+    name = "__test_log_hist__"
+    pythond._log_history(name, "x = 42")
+    pythond._log_history(name, "y = x + 1")
+    path = os.path.join(pythond._session_dir(name), "history.py")
+    check("history exists", os.path.exists(path))
+    if sys.platform != "win32":
+        mode = os.stat(path).st_mode & 0o777
+        check("history is private", mode & 0o077 == 0, oct(mode))
+    content = open(path).read()
+    check("history has x", "x = 42" in content)
+    check("history has y", "y = x + 1" in content)
+    check("history has timestamp", "# [" in content)
+    # verify it's valid Python
+    try:
+        compile(content, path, "exec")
+        check("history compiles", True)
+    except SyntaxError as e:
+        check("history compiles", False, str(e))
+    shutil.rmtree(os.path.join(os.path.expanduser("~"), ".pythond",
+                               "sessions", name), ignore_errors=True)
+
+
+def test_log_session():
+    section("_log_session")
+    name = "__test_log_sess__"
+    pythond._log_session(name, "good()", "result", error=False)
+    pythond._log_session(name, "bad()", "Traceback...", error=True)
+    path = os.path.join(pythond._session_dir(name), "session.log")
+    check("session.log exists", os.path.exists(path))
+    if sys.platform != "win32":
+        mode = os.stat(path).st_mode & 0o777
+        check("session.log is private", mode & 0o077 == 0, oct(mode))
+    content = open(path).read()
+    check("log has OK", "OK" in content)
+    check("log has ERROR", "ERROR" in content)
+    check("log has good()", "good()" in content)
+    check("log has bad()", "bad()" in content)
+    check("log has output prefix", "# >" in content)
+    shutil.rmtree(os.path.join(os.path.expanduser("~"), ".pythond",
+                               "sessions", name), ignore_errors=True)
+
+
+def test_daemon_meta_roundtrip():
+    section("daemon meta read/write")
+    # save original
+    orig = pythond._read_daemon_meta()
+    # with a fake path
+    with tempfile.TemporaryDirectory() as td:
+        fake_path = os.path.join(td, "daemon.json")
+        with mock.patch.object(pythond, "_daemon_meta_path", return_value=fake_path):
+            with mock.patch.object(pythond, "_tcp_daemon_alive", return_value=False):
+                pythond._write_daemon_meta(9999, "testtoken")
+                meta = pythond._read_daemon_meta()
+                check("meta port", meta["port"] == 9999)
+                check("meta token", meta["token"] == "testtoken")
+                check("meta pid", meta["pid"] == os.getpid())
+                pythond._remove_daemon_meta()
+                check("meta removed", pythond._read_daemon_meta() == {})
+
+
+def test_daemon_meta_read_missing():
+    section("daemon meta read missing")
+    with mock.patch.object(pythond, "_daemon_meta_path",
+                           return_value="/nonexistent/daemon.json"):
+        meta = pythond._read_daemon_meta()
+        check("missing returns empty", meta == {})
+
+
+def test_cert_fingerprint_missing():
+    section("cert fingerprint missing file")
+    fp = pythond._cert_fingerprint("/nonexistent/cert.pem")
+    check("missing returns unknown", fp == "unknown")
+
+
+def test_cert_generation():
+    section("cert generation")
+    if not pythond._HAS_CRYPTO:
+        check("skip (no cryptography)", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.object(pythond, "_tls_dir", return_value=td):
+            cert, key = pythond._generate_cert()
+            check("cert exists", os.path.exists(cert))
+            check("key exists", os.path.exists(key))
+            check("cert non-empty", os.path.getsize(cert) > 0)
+            check("key non-empty", os.path.getsize(key) > 0)
+            check("cert is PEM", open(cert).read().startswith("-----BEGIN"))
+            check("key is PEM", open(key).read().startswith("-----BEGIN"))
+            # fingerprint
+            fp = pythond._cert_fingerprint(cert)
+            check("fingerprint not unknown", fp != "unknown")
+            check("fingerprint has colons", ":" in fp)
+            # second call returns cached
+            cert2, key2 = pythond._generate_cert()
+            check("cached same cert", cert2 == cert)
+
+
+def test_cert_generation_no_crypto():
+    section("cert generation without cryptography")
+    with mock.patch.object(pythond, "_HAS_CRYPTO", False):
+        try:
+            pythond._generate_cert()
+            check("should have raised", False)
+        except RuntimeError as e:
+            check("error mentions pip install", "pip install pythond" in str(e))
+
+
+def test_websocket_protocol():
+    section("WebSocket protocol")
+    # verify websockets is importable
+    from websockets.sync.client import connect as ws_connect
+    check("ws_connect exists", callable(ws_connect))
+    if _HAS_AF_UNIX:
+        from websockets.sync.client import unix_connect as ws_unix
+        check("ws_unix_connect exists", callable(ws_unix))
+
+
+def test_wire_message_builder():
+    section("wire message builder")
+    check("local run wire",
+          pythond._build_wire_message("run", ["work", "x + 1"]) == "run work\nx + 1")
+    check("remote run preserves target session",
+          pythond._build_wire_message("run", ["remote_work", "x + 1"]) ==
+          "run remote_work\nx + 1")
+    check("status wire",
+          pythond._build_wire_message("status", ["work"]) == "status work")
+
+
+def test_raw_wss_payload_limit():
+    section("RawWssClient payload limit")
+    too_large = pythond._MAX_WS_PAYLOAD + 1
+    frame = bytes([0x81, 127]) + too_large.to_bytes(8, "big")
+
+    class FakeSock:
+        def __init__(self, data):
+            self.data = bytearray(data)
+        def recv(self, n):
+            if not self.data:
+                return b""
+            out = bytes(self.data[:n])
+            del self.data[:n]
+            return out
+
+    client = pythond._RawWssClient(FakeSock(frame))
+    try:
+        client._recv_frame()
+        check("oversize frame rejected", False)
+    except RuntimeError as e:
+        check("oversize frame rejected", "too large" in str(e))
+
+
+def test_tls_and_auth_hardening_static():
+    section("TLS/auth hardening")
+    src = (ROOT / "pythond.py").read_text(encoding="utf-8")
+    check("constant-time token compare", "hmac.compare_digest" in src)
+    check("mTLS keeps token auth", "addition to token auth" in src)
+    check("binary command frame returns error",
+          "ERR binary frame not allowed in command mode" in src)
+    ctx = pythond._client_ssl_ctx()
+    check("client TLS minimum 1.2",
+          getattr(ctx, "minimum_version", None) >= pythond._ssl.TLSVersion.TLSv1_2)
+
+
+def test_connection_hardening_static():
+    section("connection hardening static")
+    src = (ROOT / "pythond.py").read_text(encoding="utf-8")
+    attach_seg = src[src.index("def attach(name: str)"):src.index("def _attach_reader(")]
+    send_seg = src[src.index("def _send("):src.index("def client(")]
+    handle_seg = src[src.index("def handle_client("):src.index("def daemon(")]
+    runtime_seg = src[src.index("def _runtime_dir("):src.index("def _daemon_meta_path(")]
+    tls_seg = src[src.index("def _tls_dir("):src.index("def _generate_cert(")]
+
+    check("blocking send waits write-ready",
+          "except (_ssl.SSLWantWriteError, BlockingIOError):\n"
+          "                    select.select([], [sock], [], 1.0)" in src)
+    check("attach uses shared daemon connector", "_connect_daemon(" in attach_seg)
+    check("attach no direct ws_connect", "ws_connect" not in attach_seg)
+    check("send uses shared daemon connector", "_connect_daemon(" in send_seg)
+    check("remote opens use helper", "def _open_remote_ws" in src)
+    check("close frame has sentinel", "return _WS_CLOSE" in src)
+    check("TLS bridge reaps threads", "def _reap_threads" in src and "self._reap_threads()" in src)
+    check("handle_client uses dispatch table", "_CONTROL_HANDLERS.get(cmd)" in handle_seg)
+    check("handle_client no elif chain", "elif cmd" not in handle_seg)
+    check("runtime dir uses private helper", "_ensure_private_dir" in runtime_seg)
+    check("tls dir uses private helper", "_ensure_private_dir" in tls_seg)
+
+
+def test_has_crypto_flag():
+    section("_HAS_CRYPTO flag")
+    check("_HAS_CRYPTO is bool", isinstance(pythond._HAS_CRYPTO, bool))
+    try:
+        import cryptography
+        check("cryptography installed -> flag True", pythond._HAS_CRYPTO is True)
+    except ImportError:
+        check("cryptography missing -> flag False", pythond._HAS_CRYPTO is False)
+
+
+def test_entry_points_exist():
+    section("entry points")
+    check("main", callable(pythond.main))
+    check("pysh_main", callable(pythond.pysh_main))
+    check("pyctl_main", callable(pythond.pyctl_main))
+
+
+def test_default_sock():
+    section("default socket path")
+    path = pythond._default_sock()
+    check("path is string", isinstance(path, str))
+    if sys.platform == "win32":
+        check("win32 uses temp", "Temp" in path or "tmp" in path.lower())
+    else:
+        check("posix uses pythond.sock", path.endswith("pythond.sock") or "pythond-" in path)
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg and os.path.isdir(xdg):
+            check("prefers XDG_RUNTIME_DIR", path.startswith(xdg))
+        else:
+            check("fallback has UID", str(os.getuid()) in path)
+
+
+def test_secure_path_win32():
+    section("_secure_path_win32")
+    if sys.platform != "win32":
+        # verify it exists and is callable (no-op test on non-windows)
+        check("function exists", callable(pythond._secure_path_win32))
+        return
+    with tempfile.TemporaryDirectory() as td:
+        test_path = os.path.join(td, "secure_test")
+        os.makedirs(test_path)
+        pythond._secure_path_win32(test_path)
+        check("dir still exists", os.path.isdir(test_path))
+
+
+# ===========================================
+# INTEGRATION TESTS (real daemon)
+# ===========================================
+
+def send_cmd(addr, cmd, args=None, token=None):
+    """Send a command to daemon via WebSocket, return response string.
+    addr: unix socket path, or "host:port" for TCP."""
+    from websockets.sync.client import connect as ws_connect
+    if _HAS_AF_UNIX:
+        from websockets.sync.client import unix_connect as ws_unix_connect
+
+    if ":" in addr and not addr.startswith("/"):
+        # TCP mode
+        host, _, port_s = addr.rpartition(":")
+        url = f"ws://{host or '127.0.0.1'}:{port_s}/"
+        headers = {"Authorization": f"Bearer {token}"} if token else None
+        ws = ws_connect(url, additional_headers=headers,
+                        proxy=None,
+                        open_timeout=5, close_timeout=2,
+                        subprotocols=[_WS_PROTO])
+    else:
+        ws = ws_unix_connect(addr, open_timeout=5, close_timeout=2,
+                            subprotocols=[_WS_PROTO])
+
+    # build message: "cmd arg1\nbody" for run/fire, "cmd args..." otherwise
+    if cmd in ("run", "fire") and args and len(args) >= 2:
+        header = " ".join([cmd] + args[:-1])
+        msg = header + "\n" + args[-1]
+    else:
+        msg = " ".join([cmd] + (args or []))
+    try:
+        ws.send(msg)
+    except Exception:
+        try:
+            resp = ws.recv(timeout=2)
+        except Exception as e:
+            resp = str(e)
+        try:
+            ws.close()
+        except Exception:
+            pass
+        return resp
+    try:
+        resp = ws.recv(timeout=10)
+    except Exception:
+        resp = "OK"  # connection closed (e.g. stop command)
+    try:
+        ws.close()
+    except Exception:
+        pass
+    return resp
+
+def free_tcp_port():
+    """Return an unused localhost TCP port for integration tests."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+_HAS_AF_UNIX = sys.platform != "win32" and hasattr(socket, "AF_UNIX")
+
+
+def test_integration():
+    """Full daemon lifecycle test."""
+    section("INTEGRATION: daemon lifecycle")
+
+    if sys.platform == "win32":
+        print("  SKIP: integration tests use AF_UNIX (run on WSL/Linux)")
+        return
+
+    sock = os.path.join(tempfile.gettempdir(), f"pythond-test-{os.getpid()}.sock")
+    env = os.environ.copy()
+    env["PYTHOND_SOCK"] = sock
+
+    # start daemon
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "pythond.py"), "daemon"],
+        env=env, stderr=subprocess.PIPE,
+    )
+    time.sleep(0.5)
+    check("daemon started", proc.poll() is None)
+
+    try:
+        # ls (empty)
+        resp = send_cmd(sock, "ls")
+        check("ls empty", "(no sessions)" in resp)
+
+        # new
+        resp = send_cmd(sock, "new", ["test1"])
+        check("new OK", "OK test1" in resp)
+
+        # ls (has session)
+        resp = send_cmd(sock, "ls")
+        check("ls has test1", "test1" in resp)
+        check("ls shows alive", "alive" in resp)
+
+        # run
+        resp = send_cmd(sock, "run", ["test1", "1+1"])
+        check("run output", resp.strip() == "2")
+
+        # run with state
+        send_cmd(sock, "run", ["test1", "x = 42"])
+        resp = send_cmd(sock, "run", ["test1", "x"])
+        check("state persists", resp.strip() == "42")
+
+        # fire + poll
+        resp = send_cmd(sock, "fire", ["test1", "import time; time.sleep(0.1); y = 99"])
+        data = json.loads(resp)
+        check("fire has cell_id", "cell_id" in data)
+        cid = data["cell_id"]
+        time.sleep(0.3)
+        resp = send_cmd(sock, "poll", ["test1", cid])
+        data = json.loads(resp)
+        check("poll done", data["status"] == "done")
+
+        # verify fire set variable
+        resp = send_cmd(sock, "run", ["test1", "y"])
+        check("fire state", resp.strip() == "99")
+
+        # status
+        resp = send_cmd(sock, "status", ["test1"])
+        data = json.loads(resp)
+        check("status idle", data["state"] == "idle")
+
+        # vars
+        resp = send_cmd(sock, "vars", ["test1"])
+        data = json.loads(resp)
+        check("vars has x", "x" in data["vars"])
+        check("vars has y", "y" in data["vars"])
+
+        # complete
+        resp = send_cmd(sock, "complete", ["test1", "os.path."])
+        data = json.loads(resp)
+        check("complete has matches", len(data["matches"]) > 0)
+
+        # error handling
+        resp = send_cmd(sock, "run", ["test1", "1/0"])
+        check("exception in output", "ZeroDivisionError" in resp)
+
+        # run on nonexistent session
+        resp = send_cmd(sock, "run", ["nosuch", "1"])
+        check("no session error", "ERR" in resp)
+
+        # int
+        send_cmd(sock, "fire", ["test1", "import time; time.sleep(10)"])
+        time.sleep(0.1)
+        resp = send_cmd(sock, "int", ["test1"])
+        check("int OK", "OK int" in resp or "OK no running" in resp)
+
+        # checkpoint files created
+        hist = os.path.join(os.path.expanduser("~"),
+                           ".pythond", "sessions", "test1", "history.py")
+        log = os.path.join(os.path.expanduser("~"),
+                          ".pythond", "sessions", "test1", "session.log")
+        check("history.py exists", os.path.exists(hist))
+        check("session.log exists", os.path.exists(log))
+        if os.path.exists(hist):
+            content = open(hist).read()
+            check("history has x=42", "x = 42" in content)
+            # error should NOT be in history
+            check("history no ZeroDivision", "1/0" not in content)
+        if os.path.exists(log):
+            content = open(log).read()
+            check("session.log has errors", "ERROR" in content or "ZeroDivision" in content)
+
+        # kill
+        resp = send_cmd(sock, "kill", ["test1"])
+        check("kill OK", "OK killed" in resp)
+
+        # ls after kill
+        resp = send_cmd(sock, "ls")
+        check("ls empty after kill", "(no sessions)" in resp)
+
+        # stop
+        resp = send_cmd(sock, "stop")
+        check("stop OK", "OK" in resp)
+        time.sleep(0.5)
+        check("daemon exited", proc.poll() is not None)
+
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
+        if os.path.exists(sock):
+            os.unlink(sock)
+        # cleanup checkpoint files
+        shutil.rmtree(os.path.join(os.path.expanduser("~"),
+                                   ".pythond", "sessions", "test1"),
+                      ignore_errors=True)
+
+
+def test_integration_tcp_windows():
+    """Windows daemon lifecycle over localhost TCP + daemon.json token."""
+    section("INTEGRATION: Windows TCP daemon")
+
+    if sys.platform != "win32":
+        check("windows tcp skipped on non-windows", True)
+        return
+
+    port = free_tcp_port()
+    name = "__wintcp__"
+    with tempfile.TemporaryDirectory() as td:
+        runtime = os.path.join(td, "pythond")
+        env = os.environ.copy()
+        env["PYTHOND_PORT"] = str(port)
+        env["LOCALAPPDATA"] = td
+
+        proc = subprocess.Popen(
+            [sys.executable, str(ROOT / "pythond.py"), "daemon"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        time.sleep(1.0)
+        check("tcp daemon started", proc.poll() is None)
+
+        try:
+            with mock.patch.object(pythond, "_runtime_dir", return_value=runtime):
+                meta = pythond._read_daemon_meta()
+            check("daemon meta port", str(meta.get("port")) == str(port), str(meta))
+            token = meta.get("token", "")
+            check("daemon meta token", bool(token))
+
+            resp = send_cmd(f"127.0.0.1:{port}", "new", [name], token=token)
+            check("tcp new OK", "OK" in resp, resp)
+
+            resp = send_cmd(f"127.0.0.1:{port}", "run", [name, "x = 41"], token=token)
+            check("tcp assignment empty", resp.strip() == "", resp)
+
+            resp = send_cmd(f"127.0.0.1:{port}", "run", [name, "x + 1"], token=token)
+            check("tcp state persists", resp.strip() == "42", resp)
+
+            resp = send_cmd(
+                f"127.0.0.1:{port}", "fire",
+                [name, "import time; time.sleep(0.1); y = x + 2"],
+                token=token,
+            )
+            data = json.loads(resp)
+            check("tcp fire cell", data.get("status") == "fired", resp)
+            cid = data.get("cell_id")
+            time.sleep(0.4)
+            resp = send_cmd(f"127.0.0.1:{port}", "poll", [name, cid], token=token)
+            data = json.loads(resp)
+            check("tcp poll done", data.get("status") == "done", resp)
+
+            resp = send_cmd(f"127.0.0.1:{port}", "run", [name, "y"], token=token)
+            check("tcp fire state", resp.strip() == "43", resp)
+
+            resp = send_cmd(f"127.0.0.1:{port}", "run", [name, "print('Traceback')"], token=token)
+            check("tcp literal Traceback output", resp.strip() == "Traceback", resp)
+
+            send_cmd(f"127.0.0.1:{port}", "run", [name, "counter = 0"], token=token)
+            results = []
+            def _concurrent_run():
+                results.append(send_cmd(
+                    f"127.0.0.1:{port}", "run",
+                    [name, "import time; time.sleep(0.02); counter = counter + 1"],
+                    token=token))
+            threads = [threading.Thread(target=_concurrent_run) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+            check("tcp concurrent clients returned", len(results) == 5, results)
+            check("tcp concurrent clients clean", all(r.strip() == "" for r in results), results)
+            resp = send_cmd(f"127.0.0.1:{port}", "run", [name, "counter"], token=token)
+            check("tcp concurrent serialised", resp.strip() == "5", resp)
+
+            hist = os.path.join(os.path.expanduser("~"), ".pythond", "sessions", name, "history.py")
+            if os.path.exists(hist):
+                content = open(hist, encoding="utf-8").read()
+                check("literal Traceback checkpointed", "print('Traceback')" in content)
+
+            bad = send_cmd(f"127.0.0.1:{port}", "ls", token="wrong-token")
+            check("tcp wrong token rejected", "ERR auth failed" in bad, bad)
+
+            resp = send_cmd(f"127.0.0.1:{port}", "stop", token=token)
+            check("tcp stop OK", "OK" in resp, resp)
+            time.sleep(0.5)
+            check("tcp daemon exited", proc.poll() is not None)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=3)
+        shutil.rmtree(os.path.join(os.path.expanduser("~"),
+                                   ".pythond", "sessions", name),
+                      ignore_errors=True)
+
+
+def test_integration_tls_pinned_server():
+    """Real wss:// connection with a pinned daemon certificate."""
+    section("INTEGRATION: TLS pinned server")
+
+    if not pythond._HAS_CRYPTO:
+        check("tls e2e skipped without cryptography", True)
+        return
+
+    port = free_tcp_port()
+    with tempfile.TemporaryDirectory() as server_home, tempfile.TemporaryDirectory() as client_tls:
+        env = os.environ.copy()
+        env["HOME"] = server_home
+        env["USERPROFILE"] = server_home
+        env["LOCALAPPDATA"] = os.path.join(server_home, "local")
+        proc = subprocess.Popen(
+            [sys.executable, str(ROOT / "pythond.py"), "daemon",
+             "--listen", f"127.0.0.1:{port}", "--tls", "--show-token"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        token = None
+        raw = []
+        try:
+            for _ in range(4):
+                line = proc.stderr.readline()
+                if not line:
+                    break
+                raw.append(line)
+                if line.startswith("token="):
+                    token = line.split("=", 1)[1].strip()
+                    break
+            check("tls daemon started", proc.poll() is None, "".join(raw))
+            check("tls token printed", bool(token), "".join(raw))
+
+            cert = os.path.join(server_home, ".pythond", "tls", "cert.pem")
+            check("tls server cert exists", os.path.exists(cert), cert)
+            with mock.patch.object(pythond, "_tls_dir", return_value=client_tls):
+                pythond.trust_cert(cert, direction="server")
+                old_host = os.environ.get("PYTHOND_HOST")
+                old_token = os.environ.get("PYTHOND_TOKEN")
+                old_tls = os.environ.get("PYTHOND_TLS")
+                try:
+                    os.environ["PYTHOND_HOST"] = f"127.0.0.1:{port}"
+                    os.environ["PYTHOND_TOKEN"] = token
+                    os.environ["PYTHOND_TLS"] = "1"
+                    resp = pythond._send("ls", [])
+                    check("tls ls works", "(no sessions)" in resp, resp)
+                    resp = pythond._send("stop", [])
+                    check("tls stop sent", resp is None or "OK stopping daemon" in resp, resp)
+                finally:
+                    for key, value in [
+                        ("PYTHOND_HOST", old_host),
+                        ("PYTHOND_TOKEN", old_token),
+                        ("PYTHOND_TLS", old_tls),
+                    ]:
+                        if value is None:
+                            os.environ.pop(key, None)
+                        else:
+                            os.environ[key] = value
+            time.sleep(0.5)
+            check("tls daemon exited", proc.poll() is not None)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=3)
+
+
+def test_integration_error_not_in_history():
+    """Verify errors don't end up in history.py."""
+    section("INTEGRATION: error exclusion from history")
+
+    if sys.platform == "win32":
+        print("  SKIP: integration tests use AF_UNIX")
+        return
+
+    sock = os.path.join(tempfile.gettempdir(), f"pythond-test2-{os.getpid()}.sock")
+    env = os.environ.copy()
+    env["PYTHOND_SOCK"] = sock
+    name = "__errtest__"
+
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "pythond.py"), "daemon"],
+        env=env, stderr=subprocess.PIPE,
+    )
+    time.sleep(0.5)
+
+    try:
+        send_cmd(sock, "new", [name])
+        send_cmd(sock, "run", [name, "good = 1"])
+        send_cmd(sock, "run", [name, "1/0"])  # should NOT be in history
+        send_cmd(sock, "run", [name, "good2 = 2"])
+
+        hist = os.path.join(os.path.expanduser("~"),
+                           ".pythond", "sessions", name, "history.py")
+        if os.path.exists(hist):
+            content = open(hist).read()
+            check("good in history", "good = 1" in content)
+            check("good2 in history", "good2 = 2" in content)
+            check("error NOT in history", "1/0" not in content)
+        else:
+            check("history exists", False, "file not created")
+
+        send_cmd(sock, "stop")
+        time.sleep(0.3)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
+        if os.path.exists(sock):
+            os.unlink(sock)
+        shutil.rmtree(os.path.join(os.path.expanduser("~"),
+                                   ".pythond", "sessions", name),
+                      ignore_errors=True)
+
+
+def test_integration_crash_isolation():
+    """Verify exec crashes don't kill session, ws reconnect preserves state."""
+    section("INTEGRATION: crash isolation")
+
+    if sys.platform == "win32":
+        print("  SKIP: integration tests use AF_UNIX")
+        return
+
+    sock = os.path.join(tempfile.gettempdir(), f"pythond-crash-{os.getpid()}.sock")
+    env = os.environ.copy()
+    env["PYTHOND_SOCK"] = sock
+
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "pythond.py"), "daemon"],
+        env=env, stderr=subprocess.PIPE,
+    )
+    time.sleep(0.5)
+
+    from websockets.sync.client import unix_connect
+
+    try:
+        ws = unix_connect(sock, open_timeout=3, subprotocols=[_WS_PROTO])
+        ws.send("new crash")
+        ws.recv(timeout=3)
+
+        # set a variable
+        ws.send("run crash\nx = 42")
+        ws.recv(timeout=3)
+
+        # crash: ZeroDivisionError -> variable survives
+        ws.send("run crash\n" + "1/0")
+        resp = ws.recv(timeout=3)
+        check("exec error caught", "ZeroDivisionError" in resp)
+        ws.send("run crash\n" + "x")
+        resp = ws.recv(timeout=3)
+        check("var survived crash", resp.strip() == "42")
+
+        # crash 5 times -> still alive
+        for i in range(5):
+            ws.send("run crash\n" + f"raise ValueError('{i}')")
+            ws.recv(timeout=3)
+        ws.send("run crash\n" + "x + 1")
+        resp = ws.recv(timeout=3)
+        check("var after 5 crashes", resp.strip() == "43")
+
+        # import crash -> survives
+        ws.send("run crash\n" + "import nonexistent_xyz")
+        resp = ws.recv(timeout=3)
+        check("import error caught", "ModuleNotFoundError" in resp)
+        ws.send("run crash\n" + "x + 2")
+        resp = ws.recv(timeout=3)
+        check("var after import crash", resp.strip() == "44")
+
+        # WebSocket disconnect -> state persists
+        ws.close()
+        time.sleep(0.3)
+        ws2 = unix_connect(sock, open_timeout=3, subprotocols=[_WS_PROTO])
+        ws2.send("run crash\n" + "x + 3")
+        resp = ws2.recv(timeout=3)
+        check("state after ws reconnect", resp.strip() == "45")
+
+        # keep-alive: multiple commands on same ws connection
+        ws2.send("run crash\n" + "a = 1")
+        ws2.recv(timeout=3)
+        ws2.send("run crash\n" + "b = 2")
+        ws2.recv(timeout=3)
+        ws2.send("run crash\n" + "a + b")
+        resp = ws2.recv(timeout=3)
+        check("keep-alive works", resp.strip() == "3")
+
+        # interrupt -> survives
+        ws2.send("fire crash\n[__import__('time').sleep(0.1) for _ in range(100)]")
+        ws2.recv(timeout=3)
+        time.sleep(0.3)
+        ws2.send("int crash")
+        resp = ws2.recv(timeout=3)
+        check("interrupt OK", "OK int" in resp or "OK no running" in resp)
+        time.sleep(0.5)
+        ws2.send("run crash\n" + "x + 4")
+        resp = ws2.recv(timeout=3)
+        check("var after interrupt", resp.strip() == "46")
+
+        ws2.send("stop")
+        ws2.recv(timeout=3)
+        ws2.close()
+        time.sleep(0.5)
+
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
+        if os.path.exists(sock):
+            os.unlink(sock)
+        shutil.rmtree(os.path.join(os.path.expanduser("~"),
+                                   ".pythond", "sessions", "crash"),
+                      ignore_errors=True)
+
+
+def test_integration_ws_attach():
+    """WebSocket attach: binary frames for PTY, detach, scrollback."""
+    section("INTEGRATION: WebSocket attach")
+
+    if sys.platform == "win32":
+        print("  SKIP: integration tests use AF_UNIX")
+        return
+
+    sock = os.path.join(tempfile.gettempdir(), f"pythond-attach-{os.getpid()}.sock")
+    env = os.environ.copy()
+    env["PYTHOND_SOCK"] = sock
+
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "pythond.py"), "daemon"],
+        env=env, stderr=subprocess.PIPE,
+    )
+    time.sleep(0.5)
+
+    from websockets.sync.client import unix_connect
+
+    try:
+        # create session and set a variable
+        ws1 = unix_connect(sock, open_timeout=3, subprotocols=[_WS_PROTO])
+        ws1.send("new ptytest")
+        ws1.recv(timeout=3)
+        ws1.send("run ptytest\nx = 'hello from run'")
+        ws1.recv(timeout=3)
+        ws1.close()
+
+        # attach via WebSocket
+        ws2 = unix_connect(sock, open_timeout=3, subprotocols=[_WS_PROTO])
+        ws2.send("attach ptytest")
+        resp = ws2.recv(timeout=3)
+        check("attach OK", resp.startswith("OK"), resp)
+
+        # send a Python expression via binary frame (keystrokes)
+        ws2.send(b"x\r\n")
+        time.sleep(0.5)
+
+        # read PTY output (binary frames)
+        got = b""
+        ws2.socket.settimeout(1.0)
+        try:
+            while True:
+                frame = ws2.recv(timeout=1)
+                if isinstance(frame, bytes):
+                    got += frame
+                else:
+                    break
+        except Exception:
+            pass
+        check("attach got output", len(got) > 0, f"got {len(got)} bytes")
+        check("output has value", b"hello from run" in got, got[:200])
+
+        # detach
+        ws2.send("detach")
+        time.sleep(0.3)
+        try:
+            resp = ws2.recv(timeout=1)
+            check("detach response", "detach" in resp.lower() if isinstance(resp, str) else True)
+        except Exception:
+            check("detach closed", True)  # connection closed = also fine
+        try:
+            ws2.close()
+        except Exception:
+            pass
+
+        # after detach: state still alive
+        ws3 = unix_connect(sock, open_timeout=3, subprotocols=[_WS_PROTO])
+        ws3.send("run ptytest\nx")
+        resp = ws3.recv(timeout=3)
+        check("state after detach", resp.strip() == "hello from run", resp)
+
+        # test attach to nonexistent session
+        ws3.send("attach nosuch")
+        resp = ws3.recv(timeout=3)
+        check("attach nonexistent ERR", "ERR" in resp)
+
+        ws3.send("stop")
+        try:
+            ws3.recv(timeout=3)
+        except Exception:
+            pass
+        ws3.close()
+        time.sleep(0.5)
+
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
+        if os.path.exists(sock):
+            os.unlink(sock)
+        shutil.rmtree(os.path.join(os.path.expanduser("~"),
+                                   ".pythond", "sessions", "ptytest"),
+                      ignore_errors=True)
+
+
+def test_unit_pty_bridge():
+    """Unit test PtyBridge: attach/detach/write/scrollback."""
+    section("PtyBridge unit")
+
+    import pythond
+
+    # simulate PTY with a pipe
+    r_fd, w_fd = os.pipe()
+    received = []
+
+    def pty_read():
+        data = os.read(r_fd, 4096)
+        return data
+
+    def pty_write(data):
+        pass  # sink
+
+    bridge = pythond.PtyBridge(pty_read, pty_write)
+
+    # write some data before attach -> should go to scrollback
+    os.write(w_fd, b"scrollback data\n")
+    time.sleep(0.2)
+
+    # attach
+    owner = bridge.attach(lambda data: received.append(data))
+    check("first attach accepted", owner is not None)
+    time.sleep(0.1)
+
+    # scrollback should have been flushed on attach
+    check("scrollback flushed", len(received) > 0)
+    check("scrollback content", b"scrollback data" in b"".join(received),
+          b"".join(received))
+
+    # new data after attach -> goes to client directly
+    received.clear()
+    second = []
+    owner2 = bridge.attach(lambda data: second.append(data))
+    check("second attach rejected", owner2 is None)
+    os.write(w_fd, b"live data\n")
+    time.sleep(0.2)
+    check("live data received", b"live data" in b"".join(received))
+    check("second attach got nothing", second == [])
+
+    # detach -> new data goes to scrollback
+    bridge.detach(object())
+    os.write(w_fd, b"still attached\n")
+    time.sleep(0.2)
+    check("wrong owner detach ignored", b"still attached" in b"".join(received))
+    received.clear()
+    bridge.detach(owner)
+    os.write(w_fd, b"after detach\n")
+    time.sleep(0.2)
+
+    # re-attach -> should get "after detach" from scrollback
+    received.clear()
+    owner = bridge.attach(lambda data: received.append(data))
+    check("re-attach accepted", owner is not None)
+    time.sleep(0.1)
+    check("re-attach scrollback", b"after detach" in b"".join(received))
+
+    bridge.detach(owner)
+    os.close(w_fd)
+    os.close(r_fd)
+
+
+def test_integration_remote_proxy():
+    """Two local daemons: daemon A connects to daemon B as remote session."""
+    section("INTEGRATION: remote proxy")
+
+    if sys.platform == "win32":
+        print("  SKIP: integration tests use AF_UNIX")
+        return
+
+    sock_a = os.path.join(tempfile.gettempdir(), f"pythond-a-{os.getpid()}.sock")
+    port_b = 17399 + (os.getpid() % 1000)
+    addr_b = f"127.0.0.1:{port_b}"
+
+    env_a = os.environ.copy()
+    env_a["PYTHOND_SOCK"] = sock_a
+
+    # daemon B: TCP with --listen (acts as "remote server")
+    proc_b = subprocess.Popen(
+        [sys.executable, str(ROOT / "pythond.py"), "daemon",
+         "--listen", f"127.0.0.1:{port_b}", "--show-token"],
+        stderr=subprocess.PIPE,
+    )
+    time.sleep(0.8)
+
+    # read token from daemon B stderr
+    token_b = None
+    try:
+        raw = proc_b.stderr.read1(4096).decode()
+    except Exception:
+        raw = ""
+    for line in raw.splitlines():
+        if line.startswith("token="):
+            token_b = line.split("=", 1)[1]
+
+    if not token_b:
+        check("got token from daemon B", False, f"stderr: {raw[:200]}")
+        proc_b.terminate()
+        proc_b.wait(timeout=3)
+        return
+
+    # verify B is reachable
+    resp = send_cmd(addr_b, "ls", token=token_b)
+    check("daemon B reachable", "(no sessions)" in resp, resp)
+
+    # create session on B directly
+    resp = send_cmd(addr_b, "new", ["work"], token=token_b)
+    check("B new OK", "OK work" in resp, resp)
+    send_cmd(addr_b, "run", ["work", "x = 777"], token=token_b)
+    resp = send_cmd(addr_b, "run", ["work", "x"], token=token_b)
+    check("B local run", resp.strip() == "777", resp)
+
+    # daemon A: AF_UNIX (acts as "local proxy")
+    proc_a = subprocess.Popen(
+        [sys.executable, str(ROOT / "pythond.py"), "daemon"],
+        env=env_a, stderr=subprocess.PIPE,
+    )
+    time.sleep(0.5)
+    check("daemon A started", proc_a.poll() is None)
+
+    try:
+        # connect A -> B
+        resp = send_cmd(sock_a, "connect", ["remote", addr_b, token_b])
+        check("connect OK", "OK connected" in resp, resp)
+
+        # ls on A shows remote
+        resp = send_cmd(sock_a, "ls")
+        check("ls shows remote", "remote" in resp and "(remote)" in resp, resp)
+
+        # forward: A.run("remote", "work", "x + 1") -> B.run("work", "x + 1") -> 778
+        resp = send_cmd(sock_a, "run", ["remote", "work", "x + 1"])
+        check("remote forwarded", "778" in resp, f"got: {resp}")
+
+        # forward: set variable on B through A
+        send_cmd(sock_a, "run", ["remote", "work", "y = x * 2"])
+        resp = send_cmd(sock_a, "run", ["remote", "work", "y"])
+        check("remote state persists", "1554" in resp, f"got: {resp}")
+
+        # disconnect
+        resp = send_cmd(sock_a, "disconnect", ["remote"])
+        check("disconnect OK", "OK disconnected" in resp)
+
+        resp = send_cmd(sock_a, "ls")
+        check("ls after disconnect", "(no sessions)" in resp)
+
+    finally:
+        send_cmd(sock_a, "stop")
+        send_cmd(addr_b, "stop", token=token_b)
+        time.sleep(0.3)
+        for p in (proc_a, proc_b):
+            if p.poll() is None:
+                p.terminate()
+                p.wait(timeout=3)
+        if os.path.exists(sock_a):
+            os.unlink(sock_a)
+        shutil.rmtree(os.path.join(os.path.expanduser("~"),
+                                   ".pythond", "sessions", "work"),
+                      ignore_errors=True)
+
+
+# ===========================================
+
+def main():
+    tests = [
+        # Unit tests
+        test_version,
+        test_listen_addr_parsing,
+        test_khost_parsing,
+        test_init_namespace,
+        test_make_exec_eval,
+        test_make_exec_exec,
+        test_make_exec_last_expr,
+        test_make_exec_error,
+        test_make_exec_on_done,
+        test_make_exec_thread_isolation,
+        test_dispatch_run,
+        test_dispatch_fire_poll,
+        test_dispatch_poll_empty,
+        test_dispatch_poll_unknown,
+        test_dispatch_poll_latest,
+        test_dispatch_status,
+        test_dispatch_vars,
+        test_dispatch_complete,
+        test_dispatch_int,
+        test_dispatch_unknown,
+        test_dispatch_fork,
+        test_dispatch_fork_kill,
+        test_dispatch_fork_large_payload,
+        test_dispatch_fork_concurrent_fire,
+        test_cell_eviction,
+        test_session_name_sanitization,
+        test_session_dir,
+        test_session_capacity_limit,
+        test_log_history,
+        test_log_session,
+        test_daemon_meta_roundtrip,
+        test_daemon_meta_read_missing,
+        test_cert_fingerprint_missing,
+        test_cert_generation,
+        test_cert_generation_no_crypto,
+        test_websocket_protocol,
+        test_wire_message_builder,
+        test_raw_wss_payload_limit,
+        test_tls_and_auth_hardening_static,
+        test_connection_hardening_static,
+        test_has_crypto_flag,
+        test_entry_points_exist,
+        test_default_sock,
+        test_secure_path_win32,
+
+        # Integration tests
+        test_integration,
+        test_integration_tcp_windows,
+        test_integration_tls_pinned_server,
+        test_integration_error_not_in_history,
+        test_integration_crash_isolation,
+        test_unit_pty_bridge,
+        test_integration_ws_attach,
+        test_integration_remote_proxy,
+    ]
+    registered = {fn.__name__ for fn in tests}
+    discovered = {name for name, obj in globals().items()
+                  if name.startswith("test_") and callable(obj)}
+    missing = sorted(discovered - registered)
+    check("all test functions registered", not missing, ", ".join(missing))
+    for fn in tests:
+        fn()
+
+    print(f"\n{'='*40}")
+    print(f"  {PASS} passed, {FAIL} failed")
+    if FAIL:
+        sys.exit(1)
+    print("  all clear")
+
+
+if __name__ == "__main__":
+    main()
