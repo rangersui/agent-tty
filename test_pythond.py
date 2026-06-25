@@ -807,10 +807,11 @@ def test_recv_session_line_response_limit():
 
     old_limit = pythond._MAX_WORKER_RESPONSE
     pythond._MAX_WORKER_RESPONSE = 10
-    session = {"ai": FakeAi()}
+    ai = FakeAi()
+    session = {"ai": ai}
     try:
         try:
-            pythond._recv_session_line(session)
+            pythond._recv_session_line(session, ai)
             raised = False
         except ValueError as e:
             raised = str(e) == "worker response too large"
@@ -1916,8 +1917,16 @@ def test_connection_hardening_static():
     check("session command path avoids timeout-sensitive makefile",
           "makefile" not in send_session_seg and
           "_recv_session_line" in src)
+    check("send_session snapshots ai handle",
+          "ai = typing.cast(SocketLike | None, s.get(\"ai\"))" in send_session_seg and
+          "line = _recv_session_line(s, ai)" in send_session_seg and
+          "s[\"ai\"]" not in send_session_seg)
     check("recv_session_line preserves partial buffer",
           "finally:\n        s[\"_ai_buf\"] = buf" in recv_line_seg)
+    check("recv_session_line uses ai snapshot",
+          "def _recv_session_line(s: JsonDict, ai: SocketLike)" in recv_line_seg and
+          "chunk = ai.recv(_BUFFER_CHUNK)" in recv_line_seg and
+          "s[\"ai\"].recv" not in recv_line_seg)
     check("recv_session_line is bounded",
           "_MAX_WORKER_RESPONSE" in src and
           "if len(buf) > _MAX_WORKER_RESPONSE:" in recv_line_seg and

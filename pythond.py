@@ -2378,12 +2378,12 @@ def _monitor_session(name: str) -> None:
             sessions.pop(name, None)
         _close_session_resources(typing.cast(JsonDict, s_live))
 
-def _recv_session_line(s: JsonDict) -> str | None:
+def _recv_session_line(s: JsonDict, ai: SocketLike) -> str | None:
     """Read one newline-delimited JSON response from the worker socket."""
     buf = typing.cast(bytes, s.get("_ai_buf", b""))
     try:
         while b"\n" not in buf:
-            chunk = s["ai"].recv(_BUFFER_CHUNK)
+            chunk = ai.recv(_BUFFER_CHUNK)
             if not chunk:
                 return None
             buf += chunk
@@ -2412,10 +2412,13 @@ def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
         if s["type"] == "remote":
             return _send_remote(s, msg, timeout)
         if s["type"] == "pty":
+            ai = typing.cast(SocketLike | None, s.get("ai"))
+            if ai is None:
+                return {"error": f"session '{name}' dead -- pysh new {name} to restart"}
             try:
-                s["ai"].settimeout(timeout)
-                s["ai"].sendall((json.dumps(msg) + "\n").encode("utf-8"))
-                line = _recv_session_line(s)
+                ai.settimeout(timeout)
+                ai.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+                line = _recv_session_line(s, ai)
                 if not line:
                     return {"error": f"session '{name}' dead -- pysh new {name} to restart"}
                 resp: dict[str, typing.Any] = json.loads(line)
@@ -2432,7 +2435,7 @@ def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
                 return {"error": "session command failed"}
             finally:
                 try:
-                    s["ai"].settimeout(None)
+                    ai.settimeout(None)
                 except OSError:
                     pass  # socket may be dead
         return {"error": f"unsupported session type: {s.get('type')}"}
