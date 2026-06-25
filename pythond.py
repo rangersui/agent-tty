@@ -411,10 +411,20 @@ def _ensure_private_dir(path: str) -> str:
         st = os.lstat(path)
         if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
             raise RuntimeError(f"insecure directory: {path}")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = None
         try:
-            os.chmod(path, 0o700)
+            fd = os.open(path, flags)
+            os.fchmod(fd, 0o700)
         except OSError:
             raise RuntimeError(f"cannot secure directory: {path}")
+        finally:
+            if fd is not None:
+                os.close(fd)
     return path
 
 def _session_dir(name: str) -> str:

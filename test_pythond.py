@@ -1719,6 +1719,10 @@ def test_connection_hardening_static():
     check("tls dir uses private helper", "_ensure_private_dir" in tls_seg)
     check("private dir rejects insecure POSIX dirs",
           "os.lstat(path)" in private_dir_seg and "st.st_uid" in private_dir_seg)
+    check("private dir chmods opened directory fd",
+          "os.open(path, flags)" in private_dir_seg and
+          "os.fchmod(fd, 0o700)" in private_dir_seg and
+          "os.chmod(path, 0o700)" not in private_dir_seg)
     check("private dir rejects Windows reparse points",
           "GetFileAttributesW" in private_dir_seg and
           "_WIN_FILE_ATTRIBUTE_REPARSE_POINT" in private_dir_seg)
