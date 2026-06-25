@@ -3059,6 +3059,8 @@ def _handle_session_command(cmd: str, args: list[str]) -> str:
 
     if list(resp.keys()) == ["output"]:
         result = resp["output"]
+        if exec_error:
+            return f"ERR execution failed\n{result}"
         return str(result)
     return json.dumps(resp)
 

@@ -1245,6 +1245,33 @@ def test_connect_remote_bytes_auth_failure():
     check("bytes auth failure recognised", resp == "ERR auth failed on remote", resp)
 
 
+def test_session_command_execution_error_is_err():
+    section("session command execution error is ERR")
+    name = "err"
+    old_sessions = dict(pythond.sessions)
+    calls = []
+    try:
+        with pythond._sessions_lock:
+            pythond.sessions.clear()
+            pythond.sessions[name] = {"type": "pty"}
+
+        def fake_send(session_name, msg):
+            calls.append((session_name, msg))
+            return {"output": "Traceback\nZeroDivisionError", "_error": True}
+
+        with mock.patch.object(pythond, "send_session", side_effect=fake_send), \
+             mock.patch.object(pythond, "_log_session"), \
+             mock.patch.object(pythond, "_log_history"):
+            resp = pythond._handle_session_command("run", [name, "1/0"])
+        check("execution error rendered as ERR",
+              resp.startswith("ERR execution failed\nTraceback"),
+              resp)
+    finally:
+        with pythond._sessions_lock:
+            pythond.sessions.clear()
+            pythond.sessions.update(old_sessions)
+
+
 def test_session_command_arg_normalization():
     section("session command arg normalization")
     with pythond._sessions_lock:
@@ -2053,19 +2080,26 @@ def test_entry_points_exist():
 
 def test_session_cli_errors_exit_nonzero():
     section("session CLI errors exit nonzero")
-    for entry_name, argv, entry in [
-        ("pysh", ["pysh", "run", "missing", "x"], pythond.pysh_main),
-        ("pythond", ["pythond", "run", "missing", "x"], pythond.main),
-    ]:
+    cases = [
+        ("pysh", ["pysh", "run", "missing", "x"], pythond.pysh_main,
+         "ERR no session"),
+        ("pythond", ["pythond", "run", "missing", "x"], pythond.main,
+         "ERR no session"),
+        ("pysh exec error", ["pysh", "run", "work", "1/0"], pythond.pysh_main,
+         "ERR execution failed\nTraceback"),
+    ]
+    for entry_name, argv, entry, response in cases:
         with mock.patch.object(sys, "argv", argv), \
-             mock.patch.object(pythond, "_send", return_value="ERR no session"), \
-             mock.patch.object(sys, "stderr", io.StringIO()), \
+             mock.patch.object(pythond, "_send", return_value=response), \
+             mock.patch.object(sys, "stderr", io.StringIO()) as err, \
              mock.patch.object(sys, "stdout", io.StringIO()):
             try:
                 entry()
                 check(f"{entry_name} exits nonzero on ERR", False)
             except SystemExit as e:
                 check(f"{entry_name} exits nonzero on ERR", e.code == 1, e.code)
+            check(f"{entry_name} prints ERR to stderr",
+                  response in err.getvalue(), err.getvalue())
 
 
 def test_attach_loop_reports_stream_failure():
@@ -3283,6 +3317,7 @@ def main():
         test_send_remote_transparent_alias,
         test_send_remote_close_retries_and_closes,
         test_connect_remote_bytes_auth_failure,
+        test_session_command_execution_error_is_err,
         test_session_command_arg_normalization,
         test_wspro_client_basic,
         test_wspro_client_preserves_batched_frames,
