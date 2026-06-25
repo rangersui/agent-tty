@@ -1809,7 +1809,8 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
     def _cleanup_fork_children() -> None:
         _kill_running_fork_pgids(cells)
 
-    if sys.platform != "win32":
+    if (sys.platform != "win32" and
+            threading.current_thread() is threading.main_thread()):
         def _term_handler(_signum: int, _frame: object) -> None:
             raise SystemExit(0)
         signal.signal(signal.SIGTERM, _term_handler)

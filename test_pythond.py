@@ -1912,6 +1912,8 @@ def test_connection_hardening_static():
           "os.getpgid(pid)" not in dispatch_seg)
     check("worker shutdown kills fork process groups",
           "def _kill_running_fork_pgids(" in src and
+          "threading.current_thread() is threading.main_thread()" in
+          session_worker_seg and
           "signal.signal(signal.SIGTERM, _term_handler)" in session_worker_seg and
           "_cleanup_fork_children()" in session_worker_seg)
     check("fork setsid failure is fail closed",
