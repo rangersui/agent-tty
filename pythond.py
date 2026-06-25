@@ -2088,7 +2088,7 @@ class PtyBridge:
                     self._call_close_fn(close_fn)
         self._close_attached_client()
 
-def new_session(name: str) -> None:
+def new_session(name: str) -> JsonDict:
     """Create or replace one named Python session."""
     _ensure_session_capacity(name)
     if _get_session(name) is not None:
@@ -2156,6 +2156,7 @@ def new_session(name: str) -> None:
             raise
         threading.Thread(target=_monitor_session, args=(name,),
                          daemon=True).start()
+        return typing.cast(JsonDict, winpty_session)
     elif _HAS_PTY:
         master_fd = slave_fd = -1
         ai_parent = ai_child = None
@@ -2209,6 +2210,7 @@ def new_session(name: str) -> None:
             raise
         threading.Thread(target=_monitor_session, args=(name,),
                          daemon=True).start()
+        return typing.cast(JsonDict, pty_session)
     else:
         raise RuntimeError("no PTY support: pip install pywinpty (Windows)")
 
@@ -2911,12 +2913,9 @@ def _handle_new(args: list[str]) -> str:
                 f" (got extra: {' '.join(args[1:])})."
                 f" sessions are always Python")
     try:
-        new_session(name)
+        s = new_session(name)
     except (ValueError, RuntimeError) as e:
         return f"ERR {_public_error(e)}"
-    s = _get_session(name)
-    if s is None:
-        return f"ERR failed to create session '{name}'"
     winpty = s.get("winpty")
     proc = s.get("proc")
     if winpty is not None:

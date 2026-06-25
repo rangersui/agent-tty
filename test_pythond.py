@@ -1905,6 +1905,10 @@ def test_connection_hardening_static():
     check("handle_new tolerates cleared process handles",
           "winpty = s.get(\"winpty\")" in handle_new_seg and
           "proc = s.get(\"proc\")" in handle_new_seg)
+    check("handle_new reports pid from created object",
+          "def new_session(name: str) -> JsonDict:" in new_session_seg and
+          "s = new_session(name)" in handle_new_seg and
+          "_get_session(name)" not in handle_new_seg)
     check("handle_ls tolerates cleared process handles",
           "winpty = s.get(\"winpty\")" in handle_ls_seg and
           "proc = s.get(\"proc\")" in handle_ls_seg and
