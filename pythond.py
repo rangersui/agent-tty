@@ -1271,6 +1271,37 @@ def _public_names(ns: JsonDict, lock: threading.Lock | None) -> list[str]:
     with _locked(lock):
         return [v for v in ns if not v.startswith("_")]
 
+def _kill_running_fork_pgids(cells: dict[str, JsonDict]) -> int:
+    """Best-effort cleanup for live fork cell process groups."""
+    if sys.platform == "win32":
+        return 0
+    killed = 0
+    with _INTERRUPT_LOCK:
+        with _cells_lock:
+            snapshot = list(cells.values())
+        for r in snapshot:
+            if r.get("status") != "running":
+                continue
+            pid = r.get("pid")
+            pgid = r.get("pgid")
+            if not pid:
+                continue
+            try:
+                if pgid:
+                    os.killpg(int(pgid), signal.SIGKILL)  # type: ignore[attr-defined]
+                else:
+                    os.kill(int(pid), signal.SIGKILL)  # type: ignore[attr-defined]
+                killed += 1
+            except ProcessLookupError:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)  # type: ignore[attr-defined]
+                    killed += 1
+                except (OSError, ProcessLookupError):
+                    pass  # already dead
+            except (OSError, ProcessLookupError):
+                pass  # already dead or not killable
+    return killed
+
 def _dispatch(
     cmd: str,
     args: list[str],
@@ -1653,6 +1684,14 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
     cells: dict[str, JsonDict] = {}
     lock = threading.Lock()
 
+    def _cleanup_fork_children() -> None:
+        _kill_running_fork_pgids(cells)
+
+    if sys.platform != "win32":
+        def _term_handler(_signum: int, _frame: object) -> None:
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, _term_handler)
+
     def _broadcast(src: str, output: str) -> None:
         lines = src.strip().splitlines()
         sys.stdout.write("\n")
@@ -1736,6 +1775,7 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
             except SystemExit:
                 break
     finally:
+        _cleanup_fork_children()
         with contextlib.suppress(OSError):
             ai_sock.shutdown(socket.SHUT_RDWR)
         with contextlib.suppress(OSError):

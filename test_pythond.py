@@ -563,6 +563,44 @@ def test_dispatch_fork_kills_grandchildren():
               marker.read_text() if marker.exists() else "")
 
 
+def test_fork_shutdown_cleanup_kills_grandchildren():
+    section("fork shutdown cleanup kills grandchildren")
+    if sys.platform == "win32":
+        check("fork shutdown cleanup skipped on windows", True)
+        return
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        marker = Path(tmp) / "shutdown_grandchild_survived.txt"
+        pidfile = Path(tmp) / "shutdown_grandchild.pid"
+        code = (
+            "import pathlib, subprocess, sys, time\n"
+            f"marker = {str(marker)!r}\n"
+            f"pidfile = {str(pidfile)!r}\n"
+            "child_code = \"import pathlib, time; "
+            "time.sleep(2); pathlib.Path(%r).write_text('alive')\" % marker\n"
+            "p = subprocess.Popen([sys.executable, '-c', child_code])\n"
+            "pathlib.Path(pidfile).write_text(str(p.pid))\n"
+            "time.sleep(30)\n"
+        )
+        resp = pythond._dispatch("fork", [code], _exec, cells, ns, lock)
+        cid = resp["cell_id"]
+        for _ in range(40):
+            if pidfile.exists():
+                break
+            time.sleep(0.05)
+        check("shutdown grandchild pid published", pidfile.exists())
+        killed = pythond._kill_running_fork_pgids(cells)
+        check("shutdown cleanup counted fork process group", killed >= 1, killed)
+        time.sleep(2.5)
+        resp = pythond._dispatch("poll", [cid], _exec, cells, ns)
+        check("shutdown cleanup fork done", resp["status"] == "done", resp)
+        check("shutdown grandchild did not survive", not marker.exists(),
+              marker.read_text() if marker.exists() else "")
+
+
 def test_dispatch_fork_large_payload():
     section("_dispatch fork large payload (pipe buffer test)")
     if sys.platform == "win32":
@@ -1747,6 +1785,10 @@ def test_connection_hardening_static():
     check("fork int kills process group safely",
           "os.killpg(int(pgid), signal.SIGKILL)" in dispatch_seg and
           "os.getpgid(pid)" not in dispatch_seg)
+    check("worker shutdown kills fork process groups",
+          "def _kill_running_fork_pgids(" in src and
+          "signal.signal(signal.SIGTERM, _term_handler)" in session_worker_seg and
+          "_cleanup_fork_children()" in session_worker_seg)
     check("fork setsid failure is fail closed",
           "fork child setsid failed" in dispatch_seg and "os._exit(1)" in dispatch_seg)
     check("fork closes fds on fork failure",
@@ -3145,6 +3187,7 @@ def main():
         test_dispatch_fork,
         test_dispatch_fork_kill,
         test_dispatch_fork_kills_grandchildren,
+        test_fork_shutdown_cleanup_kills_grandchildren,
         test_dispatch_fork_large_payload,
         test_dispatch_fork_concurrent_fire,
         test_cell_eviction,
