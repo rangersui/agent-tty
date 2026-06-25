@@ -850,13 +850,12 @@ def _trusted_fingerprints(directory: str) -> set[str]:
             trusted.add(fp)
     return trusted
 
-def _verify_peer_fingerprint(
+def _verify_peer_fingerprint_set(
     sock: SocketLike,
-    directory: str,
+    trusted: set[str],
     role: str,
 ) -> str:
-    """Verify peer cert fingerprint exactly; return fingerprint or raise."""
-    trusted = _trusted_fingerprints(directory)
+    """Verify peer cert fingerprint against a loaded pin set."""
     if not trusted:
         raise RuntimeError(f"no trusted {role} fingerprints")
     der = sock.getpeercert(binary_form=True)
@@ -867,6 +866,18 @@ def _verify_peer_fingerprint(
         if hmac.compare_digest(fp, expected):
             return fp
     raise RuntimeError(f"untrusted {role} certificate fingerprint")
+
+def _verify_peer_fingerprint(
+    sock: SocketLike,
+    directory: str,
+    role: str,
+) -> str:
+    """Verify peer cert fingerprint exactly; return fingerprint or raise."""
+    return _verify_peer_fingerprint_set(
+        sock,
+        _trusted_fingerprints(directory),
+        role,
+    )
 
 def _trusted_clients_dir() -> str:
     """Return ~/.pythond/tls/trusted_clients/ -- server trusts these clients."""
@@ -2371,18 +2382,20 @@ def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
 # REMOTE PROXY -- persistent TCP to remote daemon
 # -----------------------------------------------
 
-def _client_ssl_ctx() -> _ssl.SSLContext:
+def _client_ssl_ctx(server_pins: set[str] | None = None) -> _ssl.SSLContext:
     """Create TLS client context with directional trust.
 
     Loads client cert for mTLS (proving identity to server).
     Uses trusted_servers/ fingerprints for exact server verification.
     If no server pins exist, falls back to the system CA bundle.
     """
+    if server_pins is None:
+        server_pins = _trusted_fingerprints(_trusted_servers_dir())
     ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
     ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
     # If pins exist, certificate identity is checked after the handshake by
     # exact SHA-256 fingerprint, not by OpenSSL CA/path validation.
-    if _trusted_fingerprints(_trusted_servers_dir()):
+    if server_pins:
         ctx.check_hostname = False
         ctx.verify_mode = _ssl.CERT_NONE
     else:
@@ -2399,6 +2412,11 @@ def _client_ssl_ctx() -> _ssl.SSLContext:
     except (_ssl.SSLError, OSError) as e:
         print(f"WARN: client cert load failed: {e}", file=sys.stderr)
     return ctx
+
+def _client_tls_config() -> tuple[_ssl.SSLContext, set[str]]:
+    """Load server pins once and build the matching client TLS context."""
+    server_pins = _trusted_fingerprints(_trusted_servers_dir())
+    return _client_ssl_ctx(server_pins), server_pins
 
 
 class _WsproClient:
@@ -2420,14 +2438,14 @@ class _WsproClient:
         ssl_ctx: _ssl.SSLContext,
         token: str | None = None,
         timeout: float = 10,
+        server_pins: set[str] | None = None,
     ) -> "_WsproClient":
         raw = socket.create_connection((host, port), timeout=timeout)
         sock = None
         try:
             sock = ssl_ctx.wrap_socket(raw, server_hostname=host)
-            server_trust_dir = _trusted_servers_dir()
-            if _trusted_fingerprints(server_trust_dir):
-                _verify_peer_fingerprint(sock, server_trust_dir, "server")
+            if server_pins:
+                _verify_peer_fingerprint_set(sock, server_pins, "server")
             sock.settimeout(timeout)
             ws = wsproto.WSConnection(ConnectionType.CLIENT)
             headers: list[tuple[bytes, bytes]] = []
@@ -2570,7 +2588,15 @@ def _connect_wss(
     token: str | None,
     timeout: float = 10,
 ) -> _WsproClient:
-    return _WsproClient.connect(host, port, _client_ssl_ctx(), token, timeout)
+    ctx, server_pins = _client_tls_config()
+    return _WsproClient.connect(
+        host,
+        port,
+        ctx,
+        token,
+        timeout,
+        server_pins,
+    )
 
 
 def _parse_host_port(value: str, default_port: int = 7399) -> tuple[str, int]:

@@ -1718,8 +1718,13 @@ def test_connection_hardening_static():
     check("TLS server trust verifies exact fingerprint",
           "_verify_peer_fingerprint(tls_sock, self._trusted_client_dir" in tls_server_seg)
     check("TLS client pin verifies exact fingerprint",
-          "_verify_peer_fingerprint(sock, server_trust_dir, \"server\")" in wspro_seg and
+          "_verify_peer_fingerprint_set(sock, server_pins, \"server\")" in wspro_seg and
           "ctx.verify_mode = _ssl.CERT_NONE" in src)
+    check("TLS client pins are loaded once per connection",
+          "def _client_tls_config(" in src and
+          "server_pins = _trusted_fingerprints(_trusted_servers_dir())" in src and
+          "_WsproClient.connect(\n        host,\n        port,\n        ctx,\n        token,\n        timeout,\n        server_pins," in src and
+          "_trusted_fingerprints(" not in wspro_seg)
     check("cert key validation tolerates missing crypto",
           "except (AttributeError, NameError, OSError, TypeError, ValueError):" in cert_gen_seg)
     check("trusted cert load skips unreadable certs",
