@@ -1,8 +1,7 @@
 ---
 name: pythond
-description: Persistent Python runtime for AI agents. Use when the agent needs to keep variables, imports, connections, sockets, threads, servers, or analysis state alive across turns. Send code through pysh run/fire/fork/poll. Attach a human REPL. Operate local or remote pythond daemon sessions.
+description: Persistent Python runtime for AI agents. Use when the agent needs to keep variables, imports, connections, sockets, threads, servers, or analysis state alive across turns. Send code through pysh run/fire/fork/poll. Attach a human REPL. Operate local or remote pythond daemon sessions. Also covers stealth web browsing via bundled cloakbrowser reference — use when the task involves scraping, anti-bot evasion, or browser automation that must avoid detection.
 ---
-
 # pythond
 
 Persistent Python with a function-call API. Code in, result out.
@@ -65,9 +64,8 @@ pysh new work           # create a persistent session
 If daemon is not running, start it first. One daemon manages all sessions.
 Each session is an isolated subprocess with its own namespace.
 
-`pyctl start` calls the same daemon entry point as `pythond daemon`. Prefer
-`pythond daemon` in agent instructions; `pyctl` is mainly the daemon-management
-surface for humans and remote proxy setup.
+`pyctl start` is an alias for `pythond daemon`. Prefer `pythond daemon` in
+agent workflows; use `pyctl` for daemon management and remote proxy setup.
 
 ## Core Commands
 
@@ -159,16 +157,16 @@ The file is transport. The namespace is the workspace.
 
 ## Output Formats
 
-| Command | Output |
-|---------|--------|
-| `run` | raw captured text |
-| `fire` | JSON `{"cell_id": "...", "status": "fired"}` |
-| `fork` | JSON `{"cell_id": "...", "status": "forked"}` |
-| `poll` | JSON cell result |
-| `status` | JSON session health |
-| `vars` | JSON namespace names |
-| `ls` | text listing |
-| `new`, `kill`, `int` | text confirmation or error |
+| Command                    | Output                                         |
+| -------------------------- | ---------------------------------------------- |
+| `run`                    | raw captured text                              |
+| `fire`                   | JSON`{"cell_id": "...", "status": "fired"}`  |
+| `fork`                   | JSON`{"cell_id": "...", "status": "forked"}` |
+| `poll`                   | JSON cell result                               |
+| `status`                 | JSON session health                            |
+| `vars`                   | JSON namespace names                           |
+| `ls`                     | text listing                                   |
+| `new`, `kill`, `int` | text confirmation or error                     |
 
 Errors in `run` return traceback text but do not kill the session.
 
@@ -219,10 +217,10 @@ Treat pythond like SSH into a Python runtime.
 
 Runtime files and durable state are separate:
 
-| Purpose | Windows | POSIX |
-| --- | --- | --- |
+| Purpose              | Windows                                                                       | POSIX                                                   |
+| -------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------- |
 | daemon metadata/logs | `%LOCALAPPDATA%\pythond\daemon.json`, `%LOCALAPPDATA%\pythond\access.log` | `$XDG_RUNTIME_DIR/pythond/` or `/tmp/pythond-$UID/` |
-| session state/certs | `~\.pythond\sessions\...`, `~\.pythond\tls\...` | `~/.pythond/sessions/...`, `~/.pythond/tls/...` |
+| session state/certs  | `~\.pythond\sessions\...`, `~\.pythond\tls\...`                           | `~/.pythond/sessions/...`, `~/.pythond/tls/...`     |
 
 ### TLS cert management
 
@@ -283,6 +281,12 @@ assignment (`x = new_value`). Failed forks do not merge. Merge is
 last-writer-wins: a finished fork can overwrite a variable that the parent
 changed while the fork was running.
 
+## Session Lifecycle
+
+Sessions survive indefinitely while the daemon runs. If the daemon restarts,
+sessions are lost — replay from checkpoint history (see below). If a session
+crashes, create a new one with the same name and replay.
+
 ## Checkpoints
 
 Successful synchronous `run` cells are appended to
@@ -317,3 +321,12 @@ Transport: `ws://` (local), `wss://` (remote TLS).
 - Do not move task state back into the host shell once a session exists.
 - Do not manage daemon WebSocket lifetimes manually. The CLI may use short
   connections; remote proxy connections are held by the daemon.
+
+## References
+
+Bundled reference docs for specific integration patterns. Read the relevant
+file when the task matches.
+
+| File                           | When to read                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `reference/cloakbrowser.md` | Task involves web scraping, browsing behind anti-bot protection, or interacting with sites that detect automation. Covers cloakserve daemon setup, connect_over_cdp, per-connection fingerprints, persistent profiles, and humanize. Prefer cloakserve (standalone daemon) over launch() so the browser survives Python restarts. |
